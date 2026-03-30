@@ -1,5 +1,11 @@
 # bridgerton
 
+## 0.4.0
+
+### Minor Changes
+
+- [#3](https://github.com/struong/bridgerton/pull/3) [`8feeb8d`](https://github.com/struong/bridgerton/commit/8feeb8d75f74e84c261b767851fdca074a3a3b44) Thanks [@letstokenize](https://github.com/letstokenize)! - `external-accounts create` now defaults to Plaid Link — run it with just a customer ID to open a browser-based bank linking flow. Pass `--accountNumber`, `--routingNumber`, and `--accountOwnerName` to create manually instead.
+
 ## 0.3.1
 
 ### Patch Changes
