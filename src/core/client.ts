@@ -34,14 +34,14 @@ const base = () =>
 /** Returns the full URL for a Bridge API path. */
 export const url = (path: string) => `${base()}${path}`
 
-function request(method: string, path: string, body?: Record<string, unknown>) {
+function request(method: string, path: string, body?: Record<string, unknown>, opts?: { skipIdempotency?: boolean }) {
   const apiKey = getApiKey()
   if (!apiKey) throw new Error('No Bridge API key configured. Run: bridgerton configure api-key <key>')
   const h: Record<string, string> = {
     'Api-Key': apiKey,
     'Content-Type': 'application/json',
   }
-  if (method === 'POST' || method === 'PUT')
+  if ((method === 'POST' || method === 'PUT') && !opts?.skipIdempotency)
     h['Idempotency-Key'] = crypto.randomUUID()
 
   return fetch(url(path), {
@@ -59,7 +59,7 @@ export const bridge = {
     return request('GET', path + qs)
   },
   /** POST to a Bridge API endpoint. */
-  post: (path: string, body: Record<string, unknown>) => request('POST', path, body),
+  post: (path: string, body: Record<string, unknown>, opts?: { skipIdempotency?: boolean }) => request('POST', path, body, opts),
   /** PUT to a Bridge API endpoint. */
   put: (path: string, body: Record<string, unknown>) => request('PUT', path, body),
   /** DELETE a Bridge API endpoint. */
