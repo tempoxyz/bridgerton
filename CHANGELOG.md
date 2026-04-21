@@ -1,5 +1,11 @@
 # bridgerton
 
+## 0.5.0
+
+### Minor Changes
+
+- [#5](https://github.com/struong/bridgerton/pull/5) [`eaa2836`](https://github.com/struong/bridgerton/commit/eaa2836301bcfe6d0a0ef2a987660f2db5786ce6) Thanks [@struong](https://github.com/struong)! - Add `cards` command group for Bridge card issuance, management, transactions, and mobile wallet provisioning.
+
 ## 0.4.0
 
 ### Minor Changes
