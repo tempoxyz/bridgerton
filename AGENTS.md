@@ -21,12 +21,13 @@ src/
     ├── plaid-link.ts   # Plaid Link flow (link_token, local server, public_token exchange)
     ├── virtual-accounts.ts  # Virtual accounts API
     ├── prefunded-accounts.ts # Prefunded accounts API
+    ├── cards.ts             # Cards API (card accounts, transactions, authorizations, withdrawals)
     └── exchange-rates.ts    # Exchange rates API
 ```
 
 ## Key Design Decisions
 
-- **incur subcommand groups**: `customers`, `wallets`, `transfers`, `liquidation`, `external-accounts`, `virtual-accounts`, `prefunded-accounts`, `configure` as sub-CLIs
+- **incur subcommand groups**: `customers`, `wallets`, `transfers`, `liquidation`, `external-accounts`, `virtual-accounts`, `prefunded-accounts`, `cards`, `configure` as sub-CLIs
 - **core/client.ts**: thin fetch wrapper, reads API key from `~/.config/bridgerton/config.json` or `BRIDGE_API_KEY` env var
 - **Auto-detect**: `sk-test-*` → sandbox (`https://api.sandbox.bridge.xyz/v0`), `sk-live-*` → production (`https://api.bridge.xyz/v0`)
 - **Plaid Link**: `external-accounts create` defaults to Plaid Link (browser-based bank linking). Pass `--accountNumber`, `--routingNumber`, `--accountOwnerName` for manual creation
