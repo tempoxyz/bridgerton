@@ -8,6 +8,7 @@ import { createVirtualAccount, getVirtualAccount, listVirtualAccounts, listAllVi
 import { getExchangeRates } from './core/exchange-rates.js'
 import { runPlaidLinkFlow } from './core/plaid-link.js'
 import { listPrefundedAccounts, getPrefundedAccount, getPrefundedAccountHistory } from './core/prefunded-accounts.js'
+import { provisionCardAccount, getCardAccount, listCardAccounts, updateCardAccount, freezeCardAccount, unfreezeCardAccount, listCardTransactions, getCardTransaction, listCardAuthorizations, getAuthorizationControls, createCardWithdrawal, listCardWithdrawals, getCardWithdrawal, addDepositAddress, createMobileWalletProvisioningRequest, listCardDesigns, getCardProgramSummary } from './core/cards.js'
 import { writeConfig, getApiKey, getDefaultFormat } from './core/client.js'
 import pkg from '../package.json' with { type: 'json' }
 
@@ -483,6 +484,243 @@ prefundedAccounts.command('history', {
 })
 
 cli.command(prefundedAccounts)
+
+// --- cards subcommand group ---
+const cards = Cli.create('cards', { description: 'Manage card accounts and transactions.' })
+
+cards.command('provision', {
+  description: 'Provision a card account for a customer',
+  args: z.object({ customerId: z.string().describe('Customer ID') }),
+  options: z.object({
+    currency: z.string().default('usdc').describe('Crypto currency (usdc, usdb)'),
+    chain: z.string().default('solana').describe('Blockchain (solana, ethereum, base, arbitrum, optimism, polygon, stellar, tron)'),
+    cryptoAccountType: z.string().optional().describe('Crypto account type (bridge_wallet, external_wallet)'),
+    cryptoAccountAddress: z.string().optional().describe('Crypto account address'),
+    clientReferenceId: z.string().optional().describe('Client-provided reference ID'),
+    cardDesign: z.string().optional().describe('Card design shortname'),
+  }),
+  async run(c) {
+    const body: any = { currency: c.options.currency, chain: c.options.chain }
+    if (c.options.cryptoAccountType || c.options.cryptoAccountAddress) {
+      body.crypto_account = {}
+      if (c.options.cryptoAccountType) body.crypto_account.type = c.options.cryptoAccountType
+      if (c.options.cryptoAccountAddress) body.crypto_account.address = c.options.cryptoAccountAddress
+    }
+    if (c.options.clientReferenceId) body.client_reference_id = c.options.clientReferenceId
+    if (c.options.cardDesign) body.card_design_shortname = c.options.cardDesign
+    return provisionCardAccount(c.args.customerId, body)
+  },
+})
+
+cards.command('get', {
+  description: 'Retrieve a card account',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  async run(c) { return getCardAccount(c.args.customerId, c.args.cardAccountId) },
+})
+
+cards.command('list', {
+  description: 'List card accounts for a customer',
+  args: z.object({ customerId: z.string().describe('Customer ID') }),
+  async run(c) { return listCardAccounts(c.args.customerId) },
+})
+
+cards.command('update', {
+  description: 'Update a card account (change currency or close)',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  options: z.object({
+    currency: z.string().optional().describe('New settlement currency'),
+    status: z.enum(['inactive']).optional().describe('Set to "inactive" to permanently close the card account'),
+  }),
+  async run(c) {
+    const body: any = {}
+    if (c.options.currency) body.currency = c.options.currency
+    if (c.options.status) body.status = c.options.status
+    return updateCardAccount(c.args.customerId, c.args.cardAccountId, body)
+  },
+})
+
+cards.command('freeze', {
+  description: 'Freeze a card account',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  options: z.object({
+    initiator: z.enum(['developer', 'customer']).default('developer').describe('Freeze initiator'),
+    reason: z.enum(['lost_or_stolen', 'suspicious_activity', 'planned_inactivity', 'suspected_fraud', 'other']).describe('Freeze reason'),
+    reasonDetail: z.string().optional().describe('Detailed reason for the freeze'),
+    endingAt: z.string().optional().describe('End time for the freeze (ISO8601)'),
+  }),
+  async run(c) {
+    const body: any = { initiator: c.options.initiator, reason: c.options.reason }
+    if (c.options.reasonDetail) body.reason_detail = c.options.reasonDetail
+    if (c.options.endingAt) body.ending_at = c.options.endingAt
+    return freezeCardAccount(c.args.customerId, c.args.cardAccountId, body)
+  },
+})
+
+cards.command('unfreeze', {
+  description: 'Remove a freeze from a card account',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  options: z.object({
+    initiator: z.enum(['developer', 'customer']).default('developer').describe('Initiator of the freeze to remove'),
+  }),
+  async run(c) {
+    return unfreezeCardAccount(c.args.customerId, c.args.cardAccountId, { initiator: c.options.initiator })
+  },
+})
+
+cards.command('transactions', {
+  description: 'List settled card transactions',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  async run(c) { return listCardTransactions(c.args.customerId, c.args.cardAccountId) },
+})
+
+cards.command('transaction', {
+  description: 'Get a single card transaction',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+    transactionId: z.string().describe('Transaction ID'),
+  }),
+  async run(c) { return getCardTransaction(c.args.customerId, c.args.cardAccountId, c.args.transactionId) },
+})
+
+cards.command('authorizations', {
+  description: 'List pending card authorizations',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  async run(c) { return listCardAuthorizations(c.args.customerId, c.args.cardAccountId) },
+})
+
+cards.command('authorization-controls', {
+  description: 'Get spend limits for a card account',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  async run(c) { return getAuthorizationControls(c.args.customerId, c.args.cardAccountId) },
+})
+
+cards.command('withdraw', {
+  description: 'Create a funds withdrawal (top-up accounts only)',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  options: z.object({
+    amount: z.string().describe('Withdrawal amount'),
+    currency: z.string().default('usdc').describe('Currency'),
+    destinationAddress: z.string().describe('Destination crypto address'),
+    chain: z.string().describe('Destination chain'),
+  }),
+  async run(c) {
+    return createCardWithdrawal(c.args.customerId, c.args.cardAccountId, {
+      amount: c.options.amount,
+      currency: c.options.currency,
+      destination: { address: c.options.destinationAddress, chain: c.options.chain },
+    })
+  },
+})
+
+cards.command('withdrawals', {
+  description: 'List withdrawal history (top-up accounts only)',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  async run(c) { return listCardWithdrawals(c.args.customerId, c.args.cardAccountId) },
+})
+
+cards.command('get-withdrawal', {
+  description: 'Get a single withdrawal',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+    withdrawalId: z.string().describe('Withdrawal ID'),
+  }),
+  async run(c) { return getCardWithdrawal(c.args.customerId, c.args.cardAccountId, c.args.withdrawalId) },
+})
+
+cards.command('add-deposit-address', {
+  description: 'Add a top-up deposit address on another chain',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  options: z.object({
+    chain: z.string().describe('Chain for the new deposit address'),
+  }),
+  async run(c) {
+    return addDepositAddress(c.args.customerId, c.args.cardAccountId, { chain: c.options.chain })
+  },
+})
+
+cards.command('mobile-provision', {
+  description: 'Push-provision a card to Apple Pay or Google Pay',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  options: z.object({
+    walletProvider: z.enum(['apple_pay', 'google_pay']).describe('Mobile wallet provider'),
+    certificates: z.string().optional().describe('Apple Pay: comma-separated leaf and sub-CA certificates'),
+    nonce: z.string().optional().describe('Apple Pay: nonce value'),
+    nonceSignature: z.string().optional().describe('Apple Pay: nonce signature'),
+    clientWalletAccountId: z.string().optional().describe('Google Pay: client wallet account ID'),
+    clientDeviceId: z.string().optional().describe('Google Pay: client device ID'),
+  }),
+  async run(c) {
+    const body: any = { wallet_provider: c.options.walletProvider }
+    if (c.options.walletProvider === 'apple_pay') {
+      body.apple_pay = {}
+      if (c.options.certificates) body.apple_pay.certificates = c.options.certificates.split(',')
+      if (c.options.nonce) body.apple_pay.nonce = c.options.nonce
+      if (c.options.nonceSignature) body.apple_pay.nonce_signature = c.options.nonceSignature
+    }
+    if (c.options.walletProvider === 'google_pay') {
+      body.google_pay = {}
+      if (c.options.clientWalletAccountId) body.google_pay.client_wallet_account_id = c.options.clientWalletAccountId
+      if (c.options.clientDeviceId) body.google_pay.client_device_id = c.options.clientDeviceId
+    }
+    return createMobileWalletProvisioningRequest(c.args.customerId, c.args.cardAccountId, body)
+  },
+})
+
+cards.command('designs', {
+  description: 'List available card designs',
+  async run() { return listCardDesigns() },
+})
+
+cards.command('program-summary', {
+  description: 'Get a summary of your card program',
+  options: z.object({
+    startDate: z.string().optional().describe('Start date (ISO8601)'),
+    endDate: z.string().optional().describe('End date (ISO8601)'),
+  }),
+  async run(c) {
+    const params: Record<string, string> = {}
+    if (c.options.startDate) params.start_date = c.options.startDate
+    if (c.options.endDate) params.end_date = c.options.endDate
+    return getCardProgramSummary(Object.keys(params).length ? params : undefined)
+  },
+})
+
+cli.command(cards)
 
 // --- configure subcommand group ---
 const configure = Cli.create('configure', { description: 'Manage CLI configuration.' })
