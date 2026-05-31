@@ -1,3 +1,4 @@
+import { chmodSync, writeFileSync } from 'node:fs'
 import { Cli, z } from 'incur'
 import { createCustomer, getCustomer, listCustomers, updateCustomer, deleteCustomer, createTosLink, getKycLink, getTosAcceptanceLink, listCustomerTransfers } from './core/customers.js'
 import { createWallet, getWallet, listWallets, listAllWallets, getWalletTotalBalances, getWalletHistory } from './core/wallets.js'
@@ -8,8 +9,9 @@ import { createVirtualAccount, getVirtualAccount, listVirtualAccounts, listAllVi
 import { getExchangeRates } from './core/exchange-rates.js'
 import { runPlaidLinkFlow } from './core/plaid-link.js'
 import { listPrefundedAccounts, getPrefundedAccount, getPrefundedAccountHistory } from './core/prefunded-accounts.js'
-import { provisionCardAccount, getCardAccount, listCardAccounts, updateCardAccount, freezeCardAccount, unfreezeCardAccount, listCardTransactions, getCardTransaction, listCardAuthorizations, getAuthorizationControls, createCardWithdrawal, listCardWithdrawals, getCardWithdrawal, addDepositAddress, createMobileWalletProvisioningRequest, listCardDesigns, getCardProgramSummary } from './core/cards.js'
-import { writeConfig, getApiKey, getDefaultFormat } from './core/client.js'
+import { getCardAccount, listCardAccounts, updateCardAccount, freezeCardAccount, unfreezeCardAccount, createCardPinUpdateUrl, createCardEphemeralKey, createCardStatement, createStripeCardStatement, listCardTransactions, getCardTransaction, listCardAuthorizations, getAuthorizationControls, createCardWithdrawal, listCardWithdrawals, getCardWithdrawal, addDepositAddress, createMobileWalletProvisioningRequest, listCardDesigns, getCardProgramSummary } from './core/cards.js'
+import { getIssuingCardholder, listIssuingCardholders, getIssuingCard, listIssuingCards, updateIssuingCard, freezeIssuingCard, unfreezeIssuingCard, createIssuingCard, getIssuingTransaction, listIssuingTransactions, getIssuingAuthorization, listIssuingAuthorizations } from './core/stripe.js'
+import { writeConfig, getApiKey, getStripeApiKey, getDefaultFormat, maskSecret } from './core/client.js'
 import pkg from '../package.json' with { type: 'json' }
 
 const cli = Cli.create('bridgerton', {
@@ -22,9 +24,22 @@ const cli = Cli.create('bridgerton', {
       'list all transfers',
       'create a liquidation address on tempo',
       'check exchange rates',
+      'create a Stripe virtual card backed by a Tempo wallet',
     ],
   },
 })
+
+function saveDownloadedFile(output: string, download: { body: Buffer; contentType: string | null; contentDisposition: string | null }) {
+  writeFileSync(output, download.body, { mode: 0o600 })
+  chmodSync(output, 0o600)
+  return {
+    saved: true,
+    output,
+    content_type: download.contentType,
+    content_disposition: download.contentDisposition,
+    bytes: download.body.byteLength,
+  }
+}
 
 // --- customers subcommand group ---
 const customers = Cli.create('customers', { description: 'Manage Bridge customers (KYC/KYB).' })
@@ -486,34 +501,231 @@ prefundedAccounts.command('history', {
 cli.command(prefundedAccounts)
 
 // --- cards subcommand group ---
-const cards = Cli.create('cards', { description: 'Manage card accounts and transactions.' })
+const cards = Cli.create('cards', { description: 'Manage Tempo wallet-backed Stripe Issuing cards.' })
 
-cards.command('provision', {
-  description: 'Provision a card account for a customer',
-  args: z.object({ customerId: z.string().describe('Customer ID') }),
+cards.command('create', {
+  description: 'Create a virtual Stripe Issuing card backed by a Tempo wallet',
   options: z.object({
-    currency: z.string().default('usdc').describe('Crypto currency (usdc, usdb)'),
-    chain: z.string().default('solana').describe('Blockchain (solana, ethereum, base, arbitrum, optimism, polygon, stellar, tron)'),
-    cryptoAccountType: z.string().optional().describe('Crypto account type (bridge_wallet, external_wallet)'),
-    cryptoAccountAddress: z.string().optional().describe('Crypto account address'),
-    clientReferenceId: z.string().optional().describe('Client-provided reference ID'),
-    cardDesign: z.string().optional().describe('Card design shortname'),
+    cardholder: z.string().describe('Stripe Issuing cardholder ID'),
+    walletAddress: z.string().describe('Tempo wallet address backing the card; must be unique to this customer'),
+    idempotencyKey: z.string().describe('Stripe idempotency key for safe retries'),
+    bridgeCustomerId: z.string().optional().describe('Bridge customer ID to store in Stripe metadata'),
   }),
   async run(c) {
-    const body: any = { currency: c.options.currency, chain: c.options.chain }
-    if (c.options.cryptoAccountType || c.options.cryptoAccountAddress) {
-      body.crypto_account = {}
-      if (c.options.cryptoAccountType) body.crypto_account.type = c.options.cryptoAccountType
-      if (c.options.cryptoAccountAddress) body.crypto_account.address = c.options.cryptoAccountAddress
+    const data: {
+      cardholder: string
+      walletAddress: string
+      idempotencyKey: string
+      bridgeCustomerId?: string
+    } = {
+      cardholder: c.options.cardholder,
+      walletAddress: c.options.walletAddress,
+      idempotencyKey: c.options.idempotencyKey,
     }
-    if (c.options.clientReferenceId) body.client_reference_id = c.options.clientReferenceId
-    if (c.options.cardDesign) body.card_design_shortname = c.options.cardDesign
-    return provisionCardAccount(c.args.customerId, body)
+    if (c.options.bridgeCustomerId) data.bridgeCustomerId = c.options.bridgeCustomerId
+    return createIssuingCard(data)
+  },
+})
+
+cards.command('list', {
+  description: 'List Stripe Issuing cards',
+  options: z.object({
+    cardholder: z.string().optional().describe('Only return cards belonging to this cardholder'),
+    status: z.enum(['active', 'inactive', 'canceled']).optional().describe('Only return cards with this status'),
+    type: z.enum(['virtual', 'physical']).optional().describe('Only return cards with this type'),
+    last4: z.string().optional().describe('Only return cards with these last four digits'),
+    limit: z.string().optional().describe('Maximum number of cards to return (1-100)'),
+    startingAfter: z.string().optional().describe('Pagination cursor'),
+    endingBefore: z.string().optional().describe('Pagination cursor'),
+  }),
+  async run(c) {
+    return listIssuingCards({
+      cardholder: c.options.cardholder,
+      status: c.options.status,
+      type: c.options.type,
+      last4: c.options.last4,
+      limit: c.options.limit ? Number(c.options.limit) : undefined,
+      startingAfter: c.options.startingAfter,
+      endingBefore: c.options.endingBefore,
+    })
   },
 })
 
 cards.command('get', {
-  description: 'Retrieve a card account',
+  description: 'Retrieve a Stripe Issuing card',
+  args: z.object({ id: z.string().describe('Stripe Issuing card ID') }),
+  async run(c) { return getIssuingCard(c.args.id) },
+})
+
+cards.command('update', {
+  description: 'Update a Stripe Issuing card status',
+  args: z.object({ id: z.string().describe('Stripe Issuing card ID') }),
+  options: z.object({
+    status: z.enum(['active', 'inactive', 'canceled']).describe('New card status'),
+    cancellationReason: z.enum(['lost', 'stolen']).optional().describe('Required by Stripe when canceling a lost or stolen card'),
+  }),
+  async run(c) {
+    const data: {
+      status: 'active' | 'inactive' | 'canceled'
+      cancellationReason?: 'lost' | 'stolen'
+    } = { status: c.options.status }
+    if (c.options.cancellationReason) data.cancellationReason = c.options.cancellationReason
+    return updateIssuingCard(c.args.id, data)
+  },
+})
+
+cards.command('freeze', {
+  description: 'Freeze a Stripe Issuing card by setting status to inactive',
+  args: z.object({ id: z.string().describe('Stripe Issuing card ID') }),
+  async run(c) { return freezeIssuingCard(c.args.id) },
+})
+
+cards.command('unfreeze', {
+  description: 'Unfreeze a Stripe Issuing card by setting status to active',
+  args: z.object({ id: z.string().describe('Stripe Issuing card ID') }),
+  async run(c) { return unfreezeIssuingCard(c.args.id) },
+})
+
+cards.command('cancel', {
+  description: 'Cancel a Stripe Issuing card',
+  args: z.object({ id: z.string().describe('Stripe Issuing card ID') }),
+  options: z.object({
+    cancellationReason: z.enum(['lost', 'stolen']).optional().describe('Reason when canceling a lost or stolen card'),
+  }),
+  async run(c) {
+    const data: { status: 'canceled'; cancellationReason?: 'lost' | 'stolen' } = { status: 'canceled' }
+    if (c.options.cancellationReason) data.cancellationReason = c.options.cancellationReason
+    return updateIssuingCard(c.args.id, data)
+  },
+})
+
+const cardholders = Cli.create('cardholders', { description: 'Manage Stripe Issuing cardholders.' })
+
+cardholders.command('list', {
+  description: 'List Stripe Issuing cardholders',
+  options: z.object({
+    email: z.string().optional().describe('Only return cardholders with this email'),
+    status: z.enum(['active', 'inactive', 'blocked']).optional().describe('Only return cardholders with this status'),
+    type: z.enum(['individual', 'company']).optional().describe('Only return cardholders with this type'),
+    limit: z.string().optional().describe('Maximum number of cardholders to return (1-100)'),
+    startingAfter: z.string().optional().describe('Pagination cursor'),
+    endingBefore: z.string().optional().describe('Pagination cursor'),
+  }),
+  async run(c) {
+    return listIssuingCardholders({
+      email: c.options.email,
+      status: c.options.status,
+      type: c.options.type,
+      limit: c.options.limit ? Number(c.options.limit) : undefined,
+      startingAfter: c.options.startingAfter,
+      endingBefore: c.options.endingBefore,
+    })
+  },
+})
+
+cardholders.command('get', {
+  description: 'Retrieve a Stripe Issuing cardholder',
+  args: z.object({ id: z.string().describe('Stripe Issuing cardholder ID') }),
+  async run(c) { return getIssuingCardholder(c.args.id) },
+})
+
+cards.command(cardholders)
+
+const transactions = Cli.create('transactions', { description: 'Manage Stripe Issuing transactions.' })
+
+transactions.command('list', {
+  description: 'List Stripe Issuing transactions',
+  options: z.object({
+    card: z.string().optional().describe('Only return transactions for this card'),
+    cardholder: z.string().optional().describe('Only return transactions for this cardholder'),
+    type: z.enum(['capture', 'refund']).optional().describe('Only return transactions with this type'),
+    limit: z.string().optional().describe('Maximum number of transactions to return (1-100)'),
+    startingAfter: z.string().optional().describe('Pagination cursor'),
+    endingBefore: z.string().optional().describe('Pagination cursor'),
+  }),
+  async run(c) {
+    return listIssuingTransactions({
+      card: c.options.card,
+      cardholder: c.options.cardholder,
+      type: c.options.type,
+      limit: c.options.limit ? Number(c.options.limit) : undefined,
+      startingAfter: c.options.startingAfter,
+      endingBefore: c.options.endingBefore,
+    })
+  },
+})
+
+transactions.command('get', {
+  description: 'Retrieve a Stripe Issuing transaction',
+  args: z.object({ id: z.string().describe('Stripe Issuing transaction ID') }),
+  async run(c) { return getIssuingTransaction(c.args.id) },
+})
+
+cards.command(transactions)
+
+const authorizations = Cli.create('authorizations', { description: 'Manage Stripe Issuing authorizations.' })
+
+authorizations.command('list', {
+  description: 'List Stripe Issuing authorizations',
+  options: z.object({
+    card: z.string().optional().describe('Only return authorizations for this card'),
+    cardholder: z.string().optional().describe('Only return authorizations for this cardholder'),
+    status: z.enum(['pending', 'closed', 'reversed', 'expired']).optional().describe('Only return authorizations with this status'),
+    limit: z.string().optional().describe('Maximum number of authorizations to return (1-100)'),
+    startingAfter: z.string().optional().describe('Pagination cursor'),
+    endingBefore: z.string().optional().describe('Pagination cursor'),
+  }),
+  async run(c) {
+    return listIssuingAuthorizations({
+      card: c.options.card,
+      cardholder: c.options.cardholder,
+      status: c.options.status,
+      limit: c.options.limit ? Number(c.options.limit) : undefined,
+      startingAfter: c.options.startingAfter,
+      endingBefore: c.options.endingBefore,
+    })
+  },
+})
+
+authorizations.command('get', {
+  description: 'Retrieve a Stripe Issuing authorization',
+  args: z.object({ id: z.string().describe('Stripe Issuing authorization ID') }),
+  async run(c) { return getIssuingAuthorization(c.args.id) },
+})
+
+cards.command(authorizations)
+
+const statements = Cli.create('statements', { description: 'Generate card statements.' })
+
+statements.command('create', {
+  description: 'Generate a card statement PDF using Stripe cardholder and card IDs',
+  options: z.object({
+    cardholder: z.string().describe('Stripe Issuing cardholder ID'),
+    card: z.string().describe('Stripe Issuing card ID'),
+    period: z.string().describe('Statement period in YYYYMM format'),
+    output: z.string().describe('Path to write the statement PDF'),
+  }),
+  async run(c) {
+    const download = await createStripeCardStatement(c.options.cardholder, c.options.card, c.options.period)
+    return saveDownloadedFile(c.options.output, download)
+  },
+})
+
+cards.command(statements)
+
+cli.command(cards)
+
+// --- bridge-cards subcommand group ---
+const bridgeCards = Cli.create('bridge-cards', { description: 'Manage Bridge card account utility endpoints.' })
+
+bridgeCards.command('list', {
+  description: 'List Bridge card accounts for a customer',
+  args: z.object({ customerId: z.string().describe('Customer ID') }),
+  async run(c) { return listCardAccounts(c.args.customerId) },
+})
+
+bridgeCards.command('get', {
+  description: 'Retrieve a Bridge card account',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -521,32 +733,26 @@ cards.command('get', {
   async run(c) { return getCardAccount(c.args.customerId, c.args.cardAccountId) },
 })
 
-cards.command('list', {
-  description: 'List card accounts for a customer',
-  args: z.object({ customerId: z.string().describe('Customer ID') }),
-  async run(c) { return listCardAccounts(c.args.customerId) },
-})
-
-cards.command('update', {
-  description: 'Update a card account (change currency or close)',
+bridgeCards.command('update', {
+  description: 'Update a Bridge card account',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
   }),
   options: z.object({
     currency: z.string().optional().describe('New settlement currency'),
-    status: z.enum(['inactive']).optional().describe('Set to "inactive" to permanently close the card account'),
+    status: z.enum(['inactive']).optional().describe('Set to inactive to permanently close the card account'),
   }),
   async run(c) {
-    const body: any = {}
+    const body: Record<string, unknown> = {}
     if (c.options.currency) body.currency = c.options.currency
     if (c.options.status) body.status = c.options.status
     return updateCardAccount(c.args.customerId, c.args.cardAccountId, body)
   },
 })
 
-cards.command('freeze', {
-  description: 'Freeze a card account',
+bridgeCards.command('freeze', {
+  description: 'Place a freeze on a Bridge card account',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -555,18 +761,20 @@ cards.command('freeze', {
     initiator: z.enum(['developer', 'customer']).default('developer').describe('Freeze initiator'),
     reason: z.enum(['lost_or_stolen', 'suspicious_activity', 'planned_inactivity', 'suspected_fraud', 'other']).describe('Freeze reason'),
     reasonDetail: z.string().optional().describe('Detailed reason for the freeze'),
+    startingAt: z.string().optional().describe('Start time for the freeze (ISO8601)'),
     endingAt: z.string().optional().describe('End time for the freeze (ISO8601)'),
   }),
   async run(c) {
-    const body: any = { initiator: c.options.initiator, reason: c.options.reason }
+    const body: Record<string, unknown> = { initiator: c.options.initiator, reason: c.options.reason }
     if (c.options.reasonDetail) body.reason_detail = c.options.reasonDetail
+    if (c.options.startingAt) body.starting_at = c.options.startingAt
     if (c.options.endingAt) body.ending_at = c.options.endingAt
     return freezeCardAccount(c.args.customerId, c.args.cardAccountId, body)
   },
 })
 
-cards.command('unfreeze', {
-  description: 'Remove a freeze from a card account',
+bridgeCards.command('unfreeze', {
+  description: 'Remove a freeze from a Bridge card account',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -579,8 +787,47 @@ cards.command('unfreeze', {
   },
 })
 
-cards.command('transactions', {
-  description: 'List settled card transactions',
+bridgeCards.command('pin-update-url', {
+  description: 'Create a secure PIN update URL for a Bridge card account',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  async run(c) { return createCardPinUpdateUrl(c.args.customerId, c.args.cardAccountId) },
+})
+
+bridgeCards.command('ephemeral-key', {
+  description: 'Generate an ephemeral key to reveal Bridge card details',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+  }),
+  options: z.object({
+    clientNonce: z.string().describe('Client-side nonce associated with the ephemeral key'),
+  }),
+  async run(c) {
+    return createCardEphemeralKey(c.args.customerId, c.args.cardAccountId, { client_nonce: c.options.clientNonce })
+  },
+})
+
+bridgeCards.command('statement', {
+  description: 'Generate a Bridge card account statement PDF',
+  args: z.object({
+    customerId: z.string().describe('Customer ID'),
+    cardAccountId: z.string().describe('Card account ID'),
+    period: z.string().describe('Statement period in YYYYMM format'),
+  }),
+  options: z.object({
+    output: z.string().describe('Path to write the statement PDF'),
+  }),
+  async run(c) {
+    const download = await createCardStatement(c.args.customerId, c.args.cardAccountId, c.args.period)
+    return saveDownloadedFile(c.options.output, download)
+  },
+})
+
+bridgeCards.command('transactions', {
+  description: 'List settled Bridge card transactions',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -588,8 +835,8 @@ cards.command('transactions', {
   async run(c) { return listCardTransactions(c.args.customerId, c.args.cardAccountId) },
 })
 
-cards.command('transaction', {
-  description: 'Get a single card transaction',
+bridgeCards.command('transaction', {
+  description: 'Get a single Bridge card transaction',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -598,8 +845,8 @@ cards.command('transaction', {
   async run(c) { return getCardTransaction(c.args.customerId, c.args.cardAccountId, c.args.transactionId) },
 })
 
-cards.command('authorizations', {
-  description: 'List pending card authorizations',
+bridgeCards.command('authorizations', {
+  description: 'List pending Bridge card authorizations',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -607,8 +854,8 @@ cards.command('authorizations', {
   async run(c) { return listCardAuthorizations(c.args.customerId, c.args.cardAccountId) },
 })
 
-cards.command('authorization-controls', {
-  description: 'Get spend limits for a card account',
+bridgeCards.command('authorization-controls', {
+  description: 'Get spend limits for a Bridge card account',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -616,8 +863,8 @@ cards.command('authorization-controls', {
   async run(c) { return getAuthorizationControls(c.args.customerId, c.args.cardAccountId) },
 })
 
-cards.command('withdraw', {
-  description: 'Create a funds withdrawal (top-up accounts only)',
+bridgeCards.command('withdraw', {
+  description: 'Create a funds withdrawal from a top-up Bridge card account',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -627,18 +874,24 @@ cards.command('withdraw', {
     currency: z.string().default('usdc').describe('Currency'),
     destinationAddress: z.string().describe('Destination crypto address'),
     chain: z.string().describe('Destination chain'),
+    memo: z.string().optional().describe('Destination memo'),
+    clientNote: z.string().optional().describe('Client note for the withdrawal'),
   }),
   async run(c) {
-    return createCardWithdrawal(c.args.customerId, c.args.cardAccountId, {
+    const destination: Record<string, unknown> = { address: c.options.destinationAddress, chain: c.options.chain }
+    if (c.options.memo) destination.memo = c.options.memo
+    const body: Record<string, unknown> = {
       amount: c.options.amount,
       currency: c.options.currency,
-      destination: { address: c.options.destinationAddress, chain: c.options.chain },
-    })
+      destination,
+    }
+    if (c.options.clientNote) body.client_note = c.options.clientNote
+    return createCardWithdrawal(c.args.customerId, c.args.cardAccountId, body)
   },
 })
 
-cards.command('withdrawals', {
-  description: 'List withdrawal history (top-up accounts only)',
+bridgeCards.command('withdrawals', {
+  description: 'List Bridge card withdrawal history',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -646,8 +899,8 @@ cards.command('withdrawals', {
   async run(c) { return listCardWithdrawals(c.args.customerId, c.args.cardAccountId) },
 })
 
-cards.command('get-withdrawal', {
-  description: 'Get a single withdrawal',
+bridgeCards.command('get-withdrawal', {
+  description: 'Get a single Bridge card withdrawal',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
@@ -656,7 +909,7 @@ cards.command('get-withdrawal', {
   async run(c) { return getCardWithdrawal(c.args.customerId, c.args.cardAccountId, c.args.withdrawalId) },
 })
 
-cards.command('add-deposit-address', {
+bridgeCards.command('add-deposit-address', {
   description: 'Add a top-up deposit address on another chain',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
@@ -670,25 +923,31 @@ cards.command('add-deposit-address', {
   },
 })
 
-cards.command('mobile-provision', {
-  description: 'Push-provision a card to Apple Pay or Google Pay',
+bridgeCards.command('mobile-provision', {
+  description: 'Push-provision a Bridge card to Apple Pay or Google Pay',
   args: z.object({
     customerId: z.string().describe('Customer ID'),
     cardAccountId: z.string().describe('Card account ID'),
   }),
   options: z.object({
     walletProvider: z.enum(['apple_pay', 'google_pay']).describe('Mobile wallet provider'),
-    certificates: z.string().optional().describe('Apple Pay: comma-separated leaf and sub-CA certificates'),
+    encoding: z.enum(['hex', 'base64']).optional().describe('Apple Pay certificate and nonce encoding'),
+    leafCert: z.string().optional().describe('Apple Pay leaf certificate'),
+    subordinateCert: z.string().optional().describe('Apple Pay subordinate certificate'),
+    certificates: z.string().optional().describe('Apple Pay: legacy comma-separated leaf and subordinate certificates'),
     nonce: z.string().optional().describe('Apple Pay: nonce value'),
     nonceSignature: z.string().optional().describe('Apple Pay: nonce signature'),
     clientWalletAccountId: z.string().optional().describe('Google Pay: client wallet account ID'),
     clientDeviceId: z.string().optional().describe('Google Pay: client device ID'),
   }),
   async run(c) {
-    const body: any = { wallet_provider: c.options.walletProvider }
+    const body: Record<string, any> = { wallet_provider: c.options.walletProvider }
     if (c.options.walletProvider === 'apple_pay') {
       body.apple_pay = {}
-      if (c.options.certificates) body.apple_pay.certificates = c.options.certificates.split(',')
+      const [legacyLeafCert, legacySubordinateCert] = c.options.certificates?.split(',') ?? []
+      if (c.options.encoding) body.apple_pay.encoding = c.options.encoding
+      if (c.options.leafCert || legacyLeafCert) body.apple_pay.leaf_cert = c.options.leafCert ?? legacyLeafCert
+      if (c.options.subordinateCert || legacySubordinateCert) body.apple_pay.subordinate_cert = c.options.subordinateCert ?? legacySubordinateCert
       if (c.options.nonce) body.apple_pay.nonce = c.options.nonce
       if (c.options.nonceSignature) body.apple_pay.nonce_signature = c.options.nonceSignature
     }
@@ -701,26 +960,25 @@ cards.command('mobile-provision', {
   },
 })
 
-cards.command('designs', {
-  description: 'List available card designs',
+bridgeCards.command('designs', {
+  description: 'List available Bridge card designs',
   async run() { return listCardDesigns() },
 })
 
-cards.command('program-summary', {
-  description: 'Get a summary of your card program',
+bridgeCards.command('program-summary', {
+  description: 'Get a summary of your Bridge card program',
   options: z.object({
-    startDate: z.string().optional().describe('Start date (ISO8601)'),
-    endDate: z.string().optional().describe('End date (ISO8601)'),
+    period: z.enum(['day', 'week', 'month', 'year', 'lifetime']).default('lifetime').describe('Summary period'),
+    periodKey: z.string().optional().describe('Period key, such as YYYYMM for month'),
   }),
   async run(c) {
-    const params: Record<string, string> = {}
-    if (c.options.startDate) params.start_date = c.options.startDate
-    if (c.options.endDate) params.end_date = c.options.endDate
-    return getCardProgramSummary(Object.keys(params).length ? params : undefined)
+    const params: Record<string, string> = { period: c.options.period }
+    if (c.options.periodKey) params.period_key = c.options.periodKey
+    return getCardProgramSummary(params)
   },
 })
 
-cli.command(cards)
+cli.command(bridgeCards)
 
 // --- configure subcommand group ---
 const configure = Cli.create('configure', { description: 'Manage CLI configuration.' })
@@ -732,6 +990,16 @@ configure.command('api-key', {
     writeConfig({ api_key: c.args.apiKey })
     const env = c.args.apiKey.startsWith('sk-test') ? 'sandbox' : 'production'
     return { saved: true, environment: env, config: '~/.config/bridgerton/config.json' }
+  },
+})
+
+configure.command('stripe-api-key', {
+  description: 'Save your Stripe API key',
+  args: z.object({ apiKey: z.string().describe('Stripe API key (sk_live_... or sk_test_...)') }),
+  async run(c) {
+    writeConfig({ stripe_api_key: c.args.apiKey })
+    const mode = c.args.apiKey.startsWith('sk_test') ? 'test' : 'live'
+    return { saved: true, mode, config: '~/.config/bridgerton/config.json' }
   },
 })
 
@@ -747,11 +1015,33 @@ configure.command('format', {
 configure.command('show', {
   description: 'Show current configuration',
   async run() {
-    const key = getApiKey()
-    if (!key) return { error: 'No API key configured. Run: bridgerton configure api-key <key>' }
-    const source = process.env.BRIDGE_API_KEY ? 'BRIDGE_API_KEY env var' : '~/.config/bridgerton/config.json'
-    const env = key.startsWith('sk-test') ? 'sandbox' : 'production'
-    return { api_key: key.slice(0, 12) + '...' + key.slice(-4), environment: env, format: getDefaultFormat() ?? 'toon', source }
+    const bridgeKey = getApiKey()
+    const stripeKey = getStripeApiKey()
+    const bridgeSource = process.env.BRIDGE_API_KEY ? 'BRIDGE_API_KEY env var' : bridgeKey ? '~/.config/bridgerton/config.json' : null
+    const stripeSource = process.env.STRIPE_SECRET_KEY
+      ? 'STRIPE_SECRET_KEY env var'
+      : process.env.STRIPE_API_KEY
+        ? 'STRIPE_API_KEY env var'
+        : stripeKey
+          ? '~/.config/bridgerton/config.json'
+          : null
+    return {
+      bridge: bridgeKey
+        ? {
+            api_key: maskSecret(bridgeKey),
+            environment: bridgeKey.startsWith('sk-test') ? 'sandbox' : 'production',
+            source: bridgeSource,
+          }
+        : { api_key: null, environment: null, source: null },
+      stripe: stripeKey
+        ? {
+            api_key: maskSecret(stripeKey),
+            mode: stripeKey.startsWith('sk_test') ? 'test' : 'live',
+            source: stripeSource,
+          }
+        : { api_key: null, mode: null, source: null },
+      format: getDefaultFormat() ?? 'toon',
+    }
   },
 })
 
