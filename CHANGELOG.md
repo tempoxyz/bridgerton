@@ -1,5 +1,11 @@
 # bridgerton
 
+## 0.6.0
+
+### Minor Changes
+
+- [#7](https://github.com/struong/bridgerton/pull/7) [`559205b`](https://github.com/struong/bridgerton/commit/559205b069d2eca56b6fdcd3cbf8635eb05fd855) Thanks [@letstokenize](https://github.com/letstokenize)! - Make `bridgerton cards` the Stripe Issuing command surface for Tempo wallet-backed cards, move active Bridge card-account utilities to `bridge-cards`, add Stripe API key configuration with private file permissions, and document the Bridge ToS/KYC handoff plus Tempo issuer approval flow. Card statements now require an output file instead of printing PDF content to stdout.
+
 ## 0.5.0
 
 ### Minor Changes
