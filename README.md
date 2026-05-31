@@ -101,33 +101,26 @@ bridgerton cards create \
 
 Bridge's deprecated Cards API operation is card account provisioning (`POST /customers/{customerID}/card_accounts`). New stablecoin card issuance and management for Tempo wallet-backed cards lives under `bridgerton cards`. Existing Bridge card-account utility endpoints such as list, get, update, freeze, unfreeze, transactions, authorizations, withdrawals, PIN update URL, ephemeral keys, card-account statements, card designs, and program summary remain available under `bridgerton bridge-cards`.
 
-For non-custodial Tempo wallets, approve Bridge's issuer contract before testing spend. Confirm the wallet has an access key with enough USDC.e limit, then sign the approval with that access key:
+For non-custodial Tempo wallets, approve Bridge's issuer contract before testing live spend:
 
 ```bash
 tempo wallet whoami --json-output
-tempo wallet keys
 
 export TEMPO_ROOT_ACCOUNT=0x...
 export USDC_E=0x20c000000000000000000000b9537d11c60e8b50
 export ISSUER=0x3e8f24b686aa8c036038f7d557b70e6ce0e7b56b
-export VALID_BEFORE=$(($(date +%s) + 25))
-read -rsp "Tempo access key: " TEMPO_ACCESS_KEY; echo
 
-TEMPO_ACCESS_KEY="$TEMPO_ACCESS_KEY" cast erc20-token approve "$USDC_E" "$ISSUER" 99900000 \
+cast erc20-token approve "$USDC_E" "$ISSUER" <allowance-base-units> \
   --rpc-url https://rpc.tempo.xyz \
   --chain 4217 \
   --from "$TEMPO_ROOT_ACCOUNT" \
-  --tempo.root-account "$TEMPO_ROOT_ACCOUNT" \
-  --tempo.fee-token "$USDC_E" \
-  --tempo.expiring-nonce \
-  --tempo.valid-before "$VALID_BEFORE" \
-  --gas-limit 850000 \
-  --gas-price 20000000000 \
-  --priority-gas-price 20000000000
-unset TEMPO_ACCESS_KEY
+  --browser
+
+cast call "$USDC_E" "allowance(address,address)(uint256)" "$TEMPO_ROOT_ACCOUNT" "$ISSUER" \
+  --rpc-url https://rpc.tempo.xyz
 ```
 
-This path uses access-key signing for now; it does not trigger a fresh Tempo Wallet approval prompt. Reading the key with `read -s` avoids putting it directly in shell history or a command-line flag, though it is still present in the child process environment while `cast` runs. If the selected access key has an exact 100 USDC.e spending limit, leave room for the transaction fee reserve by approving slightly less than 100 USDC.e, or provision the key with a higher limit before approving the full 100 USDC.e.
+Use the Tempo wallet signer for approval. Do not store Tempo access keys in Bridgerton config.
 
 Card statements include sensitive financial data and must be written to a file:
 
