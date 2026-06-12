@@ -185,19 +185,25 @@ transfers.command('create', {
     destRail: z.string().describe('Destination payment rail'),
     destCurrency: z.string().describe('Destination currency'),
     destAddress: z.string().optional().describe('Destination blockchain address'),
+    destWalletId: z.string().optional().describe('Destination Bridge wallet ID (when sending to a Bridge wallet)'),
     amount: z.string().optional().describe('Transfer amount'),
     flexibleAmount: z.boolean().default(false).describe('Allow any deposit amount'),
     sourceWalletId: z.string().optional().describe('Source Bridge wallet ID (when source rail is bridge_wallet)'),
     externalAccountId: z.string().optional().describe('External account ID (for off-ramps)'),
   }),
   async run(c) {
-    const { onBehalfOf, sourceRail, sourceCurrency, destRail, destCurrency, destAddress, amount, flexibleAmount, sourceWalletId, externalAccountId } = c.options
+    const { onBehalfOf, sourceRail, sourceCurrency, destRail, destCurrency, destAddress, destWalletId, amount, flexibleAmount, sourceWalletId, externalAccountId } = c.options
+    if (destAddress && destWalletId) {
+      throw new Error('Use either --dest-address or --dest-wallet-id, not both')
+    }
+
     const body: any = {
       on_behalf_of: onBehalfOf,
       source: { payment_rail: sourceRail, currency: sourceCurrency },
       destination: { payment_rail: destRail, currency: destCurrency },
     }
     if (destAddress) body.destination.to_address = destAddress
+    if (destWalletId) body.destination.bridge_wallet_id = destWalletId
     if (amount) body.amount = amount
     if (flexibleAmount) body.features = { flexible_amount: true }
     if (sourceWalletId) body.source.bridge_wallet_id = sourceWalletId
