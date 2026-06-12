@@ -63,6 +63,15 @@ bridgerton transfers create \
   --dest-rail tempo --dest-currency usdc \
   --dest-address 0x...
 
+# create a transfer to another Bridge wallet
+bridgerton transfers create \
+  --on-behalf-of <customer-id> \
+  --source-rail bridge_wallet --source-currency usdc \
+  --source-wallet-id <source-wallet-id> \
+  --dest-rail tempo --dest-currency usdc \
+  --dest-wallet-id <destination-wallet-id> \
+  --amount 1.50
+
 # set default output format
 bridgerton configure format json
 
