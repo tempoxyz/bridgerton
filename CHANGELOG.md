@@ -1,5 +1,11 @@
 # bridgerton
 
+## 0.7.0
+
+### Minor Changes
+
+- [#10](https://github.com/tempoxyz/bridgerton/pull/10) [`1bbd04c`](https://github.com/tempoxyz/bridgerton/commit/1bbd04c205da8e9fbdfd2b2ffb2929f338f602a2) Thanks [@gorried](https://github.com/gorried)! - Add a destination Bridge wallet option to transfer creation.
+
 ## 0.6.0
 
 ### Minor Changes
