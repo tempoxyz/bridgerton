@@ -2,7 +2,7 @@ import { chmodSync, writeFileSync } from 'node:fs'
 import { Cli, z } from 'incur'
 import { createCustomer, getCustomer, listCustomers, updateCustomer, deleteCustomer, createTosLink, getKycLink, getTosAcceptanceLink, listCustomerTransfers } from './core/customers.js'
 import { createWallet, getWallet, listWallets, listAllWallets, getWalletTotalBalances, getWalletHistory } from './core/wallets.js'
-import { createTransfer, getTransfer, listTransfers } from './core/transfers.js'
+import { createTransfer, getTransfer, listTransfers, updateTransfer, deleteTransfer, listStaticTemplates } from './core/transfers.js'
 import { createLiquidation, getLiquidation, listLiquidations, listDrains, updateLiquidation, listAllDrains } from './core/liquidation.js'
 import { createExternalAccount, getExternalAccount, listExternalAccounts, deleteExternalAccount } from './core/external-accounts.js'
 import { createVirtualAccount, getVirtualAccount, listVirtualAccounts, listAllVirtualAccounts, updateVirtualAccount, deactivateVirtualAccount, reactivateVirtualAccount, getVirtualAccountActivity, getAllVirtualAccountActivity } from './core/virtual-accounts.js'
@@ -22,6 +22,7 @@ const cli = Cli.create('bridgerton', {
     suggestions: [
       'create a wallet on tempo for a customer',
       'list all transfers',
+      'create a static transfer template',
       'create a liquidation address on tempo',
       'check exchange rates',
       'create a Stripe virtual card backed by a Tempo wallet',
@@ -39,6 +40,99 @@ function saveDownloadedFile(output: string, download: { body: Buffer; contentTyp
     content_disposition: download.contentDisposition,
     bytes: download.body.byteLength,
   }
+}
+
+type TransferCreateOptions = {
+  onBehalfOf: string
+  sourceRail: string
+  sourceCurrency: string
+  destRail: string
+  destCurrency: string
+  destAddress?: string | undefined
+  destWalletId?: string | undefined
+  amount?: string | undefined
+  flexibleAmount?: boolean | undefined
+  staticTemplate?: boolean | undefined
+  allowAnyFromAddress?: boolean | undefined
+  sourceAddress?: string | undefined
+  sourceWalletId?: string | undefined
+  externalAccountId?: string | undefined
+  clientReferenceId?: string | undefined
+  developerFee?: string | undefined
+  developerFeePercent?: string | undefined
+}
+
+function transferListParams(options: {
+  limit?: string | undefined
+  startingAfter?: string | undefined
+  endingBefore?: string | undefined
+  txHash?: string | undefined
+  updatedAfterMs?: string | undefined
+  updatedBeforeMs?: string | undefined
+  templateId?: string | undefined
+  state?: string | undefined
+}) {
+  const params: Record<string, string> = {}
+  if (options.limit) params.limit = options.limit
+  if (options.startingAfter) params.starting_after = options.startingAfter
+  if (options.endingBefore) params.ending_before = options.endingBefore
+  if (options.txHash) params.tx_hash = options.txHash
+  if (options.updatedAfterMs) params.updated_after_ms = options.updatedAfterMs
+  if (options.updatedBeforeMs) params.updated_before_ms = options.updatedBeforeMs
+  if (options.templateId) params.template_id = options.templateId
+  if (options.state) params.state = options.state
+  return Object.keys(params).length ? params : undefined
+}
+
+function buildTransferBody(options: TransferCreateOptions, forceStaticTemplate = false) {
+  const {
+    onBehalfOf,
+    sourceRail,
+    sourceCurrency,
+    destRail,
+    destCurrency,
+    destAddress,
+    destWalletId,
+    amount,
+    flexibleAmount,
+    staticTemplate,
+    allowAnyFromAddress,
+    sourceAddress,
+    sourceWalletId,
+    externalAccountId,
+    clientReferenceId,
+    developerFee,
+    developerFeePercent,
+  } = options
+  if (destAddress && destWalletId) {
+    throw new Error('Use either --dest-address or --dest-wallet-id, not both')
+  }
+  if (developerFee && developerFeePercent) {
+    throw new Error('Use either --developer-fee or --developer-fee-percent, not both')
+  }
+
+  const body: any = {
+    on_behalf_of: onBehalfOf,
+    source: { payment_rail: sourceRail, currency: sourceCurrency },
+    destination: { payment_rail: destRail, currency: destCurrency },
+  }
+  if (destAddress) body.destination.to_address = destAddress
+  if (destWalletId) body.destination.bridge_wallet_id = destWalletId
+  if (amount) body.amount = amount
+  if (sourceAddress) body.source.from_address = sourceAddress
+  if (sourceWalletId) body.source.bridge_wallet_id = sourceWalletId
+  if (externalAccountId) body.source.external_account_id = externalAccountId
+  if (clientReferenceId) body.client_reference_id = clientReferenceId
+  if (developerFee) body.developer_fee = developerFee
+  if (developerFeePercent) body.developer_fee_percent = developerFeePercent
+
+  const features: Record<string, boolean> = {}
+  if (flexibleAmount) features.flexible_amount = true
+  if (allowAnyFromAddress) features.allow_any_from_address = true
+  if (staticTemplate || forceStaticTemplate) features.static_template = true
+  if (Object.keys(features).length) body.features = features
+
+  return body
 }
 
 // --- customers subcommand group ---
@@ -187,28 +281,18 @@ transfers.command('create', {
     destAddress: z.string().optional().describe('Destination blockchain address'),
     destWalletId: z.string().optional().describe('Destination Bridge wallet ID (when sending to a Bridge wallet)'),
     amount: z.string().optional().describe('Transfer amount'),
-    flexibleAmount: z.boolean().default(false).describe('Allow any deposit amount'),
+    flexibleAmount: z.boolean().optional().default(false).describe('Allow any deposit amount'),
+    staticTemplate: z.boolean().optional().default(false).describe('Create reusable static transfer template deposit instructions'),
+    allowAnyFromAddress: z.boolean().optional().default(false).describe('Allow crypto deposits from any source address'),
+    sourceAddress: z.string().optional().describe('Source blockchain address expected to send funds'),
     sourceWalletId: z.string().optional().describe('Source Bridge wallet ID (when source rail is bridge_wallet)'),
     externalAccountId: z.string().optional().describe('External account ID (for off-ramps)'),
+    clientReferenceId: z.string().optional().describe('Client reference ID'),
+    developerFee: z.string().optional().describe('Fixed developer fee'),
+    developerFeePercent: z.string().optional().describe('Developer fee percent'),
   }),
   async run(c) {
-    const { onBehalfOf, sourceRail, sourceCurrency, destRail, destCurrency, destAddress, destWalletId, amount, flexibleAmount, sourceWalletId, externalAccountId } = c.options
-    if (destAddress && destWalletId) {
-      throw new Error('Use either --dest-address or --dest-wallet-id, not both')
-    }
-
-    const body: any = {
-      on_behalf_of: onBehalfOf,
-      source: { payment_rail: sourceRail, currency: sourceCurrency },
-      destination: { payment_rail: destRail, currency: destCurrency },
-    }
-    if (destAddress) body.destination.to_address = destAddress
-    if (destWalletId) body.destination.bridge_wallet_id = destWalletId
-    if (amount) body.amount = amount
-    if (flexibleAmount) body.features = { flexible_amount: true }
-    if (sourceWalletId) body.source.bridge_wallet_id = sourceWalletId
-    if (externalAccountId) body.source.external_account_id = externalAccountId
-    return createTransfer(body)
+    return createTransfer(buildTransferBody(c.options))
   },
 })
 
@@ -220,8 +304,102 @@ transfers.command('get', {
 
 transfers.command('list', {
   description: 'List all transfers',
-  async run() { return listTransfers() },
+  options: z.object({
+    limit: z.string().optional().describe('Maximum number of transfers to return (1-100)'),
+    startingAfter: z.string().optional().describe('Pagination cursor'),
+    endingBefore: z.string().optional().describe('Pagination cursor'),
+    txHash: z.string().optional().describe('Filter by transaction hash'),
+    updatedAfterMs: z.string().optional().describe('Only transfers updated after this Unix timestamp in milliseconds'),
+    updatedBeforeMs: z.string().optional().describe('Only transfers updated before this Unix timestamp in milliseconds'),
+    templateId: z.string().optional().describe('Filter transfers created from a static template ID'),
+    state: z.string().optional().describe('Filter transfers by state'),
+  }),
+  async run(c) { return listTransfers(transferListParams(c.options)) },
 })
+
+const staticTemplates = Cli.create('static-templates', { description: 'Manage static transfer templates (saved payment routes).' })
+
+staticTemplates.command('create', {
+  description: 'Create a static transfer template with reusable deposit instructions',
+  options: z.object({
+    onBehalfOf: z.string().describe('Customer ID'),
+    sourceRail: z.string().describe('Source payment rail (ach_push, wire, ethereum, tempo, etc.)'),
+    sourceCurrency: z.string().describe('Source currency (usd, usdc, usdb, etc.)'),
+    destRail: z.string().describe('Destination payment rail'),
+    destCurrency: z.string().describe('Destination currency'),
+    destAddress: z.string().optional().describe('Destination blockchain address'),
+    destWalletId: z.string().optional().describe('Destination Bridge wallet ID'),
+    amount: z.string().optional().describe('Optional fixed transfer amount'),
+    flexibleAmount: z.boolean().optional().default(false).describe('Allow any deposit amount'),
+    allowAnyFromAddress: z.boolean().optional().default(false).describe('Allow crypto deposits from any source address'),
+    sourceAddress: z.string().optional().describe('Source blockchain address expected to send funds'),
+    sourceWalletId: z.string().optional().describe('Source Bridge wallet ID (when source rail is bridge_wallet)'),
+    externalAccountId: z.string().optional().describe('External account ID (for off-ramps)'),
+    clientReferenceId: z.string().optional().describe('Client reference ID'),
+    developerFee: z.string().optional().describe('Fixed developer fee'),
+    developerFeePercent: z.string().optional().describe('Developer fee percent'),
+  }),
+  async run(c) {
+    return createTransfer(buildTransferBody(c.options, true))
+  },
+})
+
+staticTemplates.command('list', {
+  description: 'List static transfer templates',
+  options: z.object({
+    limit: z.string().optional().describe('Maximum number of templates to return (1-100)'),
+    startingAfter: z.string().optional().describe('Pagination cursor'),
+    endingBefore: z.string().optional().describe('Pagination cursor'),
+  }),
+  async run(c) {
+    return listStaticTemplates(transferListParams(c.options))
+  },
+})
+
+staticTemplates.command('get', {
+  description: 'Get a static transfer template by ID',
+  args: z.object({ id: z.string().describe('Static template transfer ID') }),
+  async run(c) { return getTransfer(c.args.id) },
+})
+
+staticTemplates.command('instances', {
+  description: 'List transfer instances created from a static template',
+  args: z.object({ id: z.string().describe('Static template transfer ID') }),
+  options: z.object({
+    limit: z.string().optional().describe('Maximum number of transfers to return (1-100)'),
+    startingAfter: z.string().optional().describe('Pagination cursor'),
+    endingBefore: z.string().optional().describe('Pagination cursor'),
+    state: z.string().optional().describe('Filter transfer instances by state'),
+  }),
+  async run(c) {
+    return listTransfers(transferListParams({ ...c.options, templateId: c.args.id }))
+  },
+})
+
+staticTemplates.command('update', {
+  description: 'Update an awaiting static transfer template',
+  args: z.object({ id: z.string().describe('Static template transfer ID') }),
+  options: z.object({
+    amount: z.string().optional().describe('Transfer amount'),
+    developerFee: z.string().optional().describe('Fixed developer fee'),
+    developerFeePercent: z.string().optional().describe('Developer fee percent'),
+  }),
+  async run(c) {
+    const body: Record<string, unknown> = {}
+    if (c.options.amount) body.amount = c.options.amount
+    if (c.options.developerFee) body.developer_fee = c.options.developerFee
+    if (c.options.developerFeePercent) body.developer_fee_percent = c.options.developerFeePercent
+    return updateTransfer(c.args.id, body)
+  },
+})
+
+staticTemplates.command('delete', {
+  description: 'Cancel an awaiting static transfer template',
+  args: z.object({ id: z.string().describe('Static template transfer ID') }),
+  async run(c) { return deleteTransfer(c.args.id) },
+})
+
+transfers.command(staticTemplates)
 
 cli.command(transfers)
 

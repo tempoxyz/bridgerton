@@ -72,6 +72,18 @@ bridgerton transfers create \
   --dest-wallet-id <destination-wallet-id> \
   --amount 1.50
 
+# create a permanent funding route / static transfer template
+bridgerton transfers static-templates create \
+  --on-behalf-of <customer-id> \
+  --source-rail tempo --source-currency usdc \
+  --dest-rail solana --dest-currency usdb \
+  --dest-wallet-id <destination-wallet-id> \
+  --allow-any-from-address true
+
+# list static templates and transfers created from one
+bridgerton transfers static-templates list
+bridgerton transfers static-templates instances <template-id>
+
 # set default output format
 bridgerton configure format json
 
@@ -154,7 +166,7 @@ Card issuance smoke test checklist:
 |---|---|
 | `customers` | `create`, `get`, `list`, `update`, `delete`, `tos-link`, `kyc-link`, `tos-acceptance-link`, `transfers` |
 | `wallets` | `create`, `get`, `list`, `list-all`, `total-balances`, `history` |
-| `transfers` | `create`, `get`, `list` |
+| `transfers` | `create`, `get`, `list`, `static-templates create`, `static-templates list`, `static-templates get`, `static-templates instances`, `static-templates update`, `static-templates delete` |
 | `liquidation` | `create`, `get`, `list`, `update`, `drains`, `all-drains` |
 | `external-accounts` | `create`, `get`, `list`, `delete` |
 | `virtual-accounts` | `create`, `get`, `list`, `list-all`, `update`, `deactivate`, `reactivate`, `activity`, `all-activity` |
