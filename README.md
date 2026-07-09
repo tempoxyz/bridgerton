@@ -173,6 +173,7 @@ Card issuance smoke test checklist:
 | `prefunded-accounts` | `list`, `get`, `history` |
 | `cards` | `create`, `list`, `get`, `update`, `freeze`, `unfreeze`, `cancel`, `cardholders list`, `cardholders get`, `transactions list`, `transactions get`, `authorizations list`, `authorizations get`, `statements create` |
 | `bridge-cards` | `list`, `get`, `update`, `freeze`, `unfreeze`, `pin-update-url`, `ephemeral-key`, `statement`, `transactions`, `transaction`, `authorizations`, `authorization-controls`, `withdraw`, `withdrawals`, `get-withdrawal`, `add-deposit-address`, `mobile-provision`, `designs`, `program-summary` |
+| `profile` | `run`, `return-funds`, `summarize` |
 | `configure` | `api-key`, `stripe-api-key`, `format`, `show` |
 | `rates` | Get current exchange rates |
 

@@ -36,7 +36,9 @@
     "changeset:publish": "bun run build && changeset publish"
   },
   "dependencies": {
-    "incur": "0.3.13"
+    "@ngrok/ngrok": "^1.7.0",
+    "incur": "0.3.13",
+    "viem": "^2.54.6"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",
