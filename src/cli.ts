@@ -12,6 +12,7 @@ import { listPrefundedAccounts, getPrefundedAccount, getPrefundedAccountHistory 
 import { getCardAccount, listCardAccounts, updateCardAccount, freezeCardAccount, unfreezeCardAccount, createCardPinUpdateUrl, createCardEphemeralKey, createCardStatement, createStripeCardStatement, listCardTransactions, getCardTransaction, listCardAuthorizations, getAuthorizationControls, createCardWithdrawal, listCardWithdrawals, getCardWithdrawal, addDepositAddress, createMobileWalletProvisioningRequest, listCardDesigns, getCardProgramSummary } from './core/cards.js'
 import { getIssuingCardholder, listIssuingCardholders, getIssuingCard, listIssuingCards, updateIssuingCard, freezeIssuingCard, unfreezeIssuingCard, createIssuingCard, getIssuingTransaction, listIssuingTransactions, getIssuingAuthorization, listIssuingAuthorizations } from './core/stripe.js'
 import { writeConfig, getApiKey, getStripeApiKey, getDefaultFormat, maskSecret } from './core/client.js'
+import { runProfile, runReturnFunds, summarizeResults, TEMPO_USDC_E_TOKEN_ADDRESS } from './core/profile.js'
 import pkg from '../package.json' with { type: 'json' }
 
 const cli = Cli.create('bridgerton', {
@@ -1163,6 +1164,85 @@ bridgeCards.command('program-summary', {
 })
 
 cli.command(bridgeCards)
+
+// --- profile subcommand group ---
+const profile = Cli.create('profile', { description: 'Profile transfer webhook latency end-to-end (create transfers, receive webhooks, measure timings, return funds).' })
+
+profile.command('run', {
+  description: 'Run the transfer webhook latency profiler',
+  outputPolicy: 'agent-only',
+  options: z.object({
+    onBehalfOf: z.string().optional().describe('Customer ID (defaults to CUSTOMER_ID env var)'),
+    sourceRail: z.string().default('bridge_wallet').describe('Source payment rail (bridge_wallet, or tempo for deposit-funded transfers from the local wallet)'),
+    sourceCurrency: z.string().default('usdc').describe('Source currency'),
+    sourceWalletId: z.string().optional().describe('Source Bridge wallet ID (defaults to BRIDGE_WALLET_ID env var)'),
+    destRail: z.string().default('tempo').describe('Destination payment rail'),
+    destCurrency: z.string().default('usdc').describe('Destination currency'),
+    destAddress: z.string().optional().describe('Destination address (defaults to the address of PROFILE_WALLET_PRIVATE_KEY)'),
+    amount: z.string().default('1.00').describe('Transfer amount per run'),
+    runs: z.number().default(10).describe('Total number of transfers to profile'),
+    batchSize: z.number().default(10).describe('Transfers created concurrently per batch'),
+    timeoutSeconds: z.number().default(180).describe('Seconds to wait for payment_processed per transfer'),
+    returnFundsAtEnd: z.boolean().default(false).describe('Return funds once after all runs instead of per batch'),
+    batchReturnSingleTx: z.boolean().default(true).describe('Return each batch as one on-chain transaction'),
+    stopOnInsufficientBalance: z.boolean().default(true).describe('Stop early when the Bridge wallet balance is insufficient'),
+    postReturnSettleSeconds: z.number().default(0).describe('Seconds to wait after a batch return before the next batch'),
+    feeToken: z.string().default('usdc.e').describe('Tempo fee token for return transfers (usdc.e or pathusd)'),
+    tokenContract: z.string().default(TEMPO_USDC_E_TOKEN_ADDRESS).describe('Tempo token contract for returns and balance checks'),
+    tokenDecimals: z.number().default(6).describe('Token decimals'),
+    rpcUrl: z.string().default('https://rpc.tempo.xyz').describe('Tempo RPC URL (deposits, returns, and Tempo tx timestamps)'),
+    destRpcUrl: z.string().optional().describe('Destination chain RPC URL for dest tx timestamps (defaults per rail: tempo, polygon, ethereum, base, arbitrum, optimism)'),
+    webhookPort: z.number().default(8088).describe('Local webhook receiver port'),
+    webhookPath: z.string().default('/webhooks/bridge').describe('Webhook path'),
+    publicWebhookUrl: z.string().optional().describe('Public webhook URL (skips starting ngrok)'),
+    ngrokDomain: z.string().optional().describe('Reserved ngrok domain'),
+    webhookId: z.string().optional().describe('Existing Bridge webhook endpoint ID to delete and recreate'),
+    recreateWebhook: z.boolean().default(true).describe('Delete and recreate a matching Bridge webhook endpoint'),
+    deleteWebhookOnExit: z.boolean().default(true).describe('Delete the Bridge webhook endpoint on exit'),
+    eventCategories: z.string().default('all').describe('Webhook event categories (all, or comma-separated list)'),
+    eventEpoch: z.string().default('webhook_creation').describe('Webhook event epoch'),
+    selfTest: z.boolean().default(true).describe('POST a self-test event through the public URL before profiling'),
+    debugOnTimeout: z.boolean().default(true).describe('Fetch transfer state and receiver stats when a run times out'),
+    txTimestampLookup: z.boolean().default(true).describe('Look up on-chain block timestamps for webhook tx hashes'),
+    txTimestampRpcRetries: z.number().default(20).describe('RPC retries when resolving a tx timestamp'),
+    txTimestampRpcSleepSeconds: z.number().default(0.5).describe('Sleep between tx timestamp RPC retries'),
+    outputDir: z.string().default('tempo_webhook_latency_results').describe('Directory for results files'),
+    outputPrefix: z.string().optional().describe('Filename prefix for results files'),
+    clientReferencePrefix: z.string().default('bridgerton-webhook-profile').describe('Prefix for transfer client_reference_id values'),
+    verbose: z.boolean().default(false).describe('Log each webhook event as it arrives'),
+  }),
+  async run(c) { return runProfile(c.options) },
+})
+
+profile.command('return-funds', {
+  description: 'Return profiled funds: from the local wallet back to the Bridge wallet on Tempo, or from an EVM chain back to the local wallet on Tempo via a reverse Bridge transfer',
+  outputPolicy: 'agent-only',
+  options: z.object({
+    amount: z.string().optional().describe('Amount to return (defaults to the entire wallet token balance)'),
+    fromRail: z.string().default('tempo').describe('Rail holding the funds: tempo (direct send to Bridge wallet) or polygon/ethereum/base/arbitrum/optimism (reverse Bridge transfer to the local wallet on Tempo; needs native gas)'),
+    fromRpcUrl: z.string().optional().describe('RPC URL for the EVM from-rail (defaults per rail)'),
+    onBehalfOf: z.string().optional().describe('Bridge customer ID for the reverse transfer (defaults to CUSTOMER_ID env var; EVM from-rail only)'),
+    timeoutSeconds: z.number().default(600).describe('Seconds to wait for the reverse transfer to process (EVM from-rail only)'),
+    sourceWalletId: z.string().optional().describe('Bridge wallet ID to return funds to (defaults to BRIDGE_WALLET_ID env var)'),
+    bridgeWalletAddress: z.string().optional().describe('Bridge wallet address (skips the wallet lookup)'),
+    feeToken: z.string().default('usdc.e').describe('Tempo fee token (usdc.e or pathusd)'),
+    tokenContract: z.string().default(TEMPO_USDC_E_TOKEN_ADDRESS).describe('Tempo token contract to send'),
+    tokenDecimals: z.number().default(6).describe('Token decimals'),
+    currency: z.string().default('usdc').describe('Currency to return'),
+    rpcUrl: z.string().default('https://rpc.tempo.xyz').describe('Tempo RPC URL'),
+    outputDir: z.string().default('tempo_webhook_latency_results').describe('Directory for the returns log'),
+  }),
+  async run(c) { return runReturnFunds(c.options) },
+})
+
+profile.command('summarize', {
+  description: 'Print the latency summary for a previous run results JSONL file',
+  outputPolicy: 'agent-only',
+  args: z.object({ resultsFile: z.string().describe('Path to a .results.jsonl file') }),
+  async run(c) { return summarizeResults(c.args.resultsFile) },
+})
+
+cli.command(profile)
 
 // --- configure subcommand group ---
 const configure = Cli.create('configure', { description: 'Manage CLI configuration.' })
