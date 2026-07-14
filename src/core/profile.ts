@@ -105,8 +105,10 @@ function requireApiSuccess(res: ApiResponse, action: string) {
 type WebhookRecord = {
   received_epoch: number
   received_iso: string
-  /** 'webhook' when delivered to our endpoint; 'api_poll' when observed by polling the Bridge API. */
-  source?: 'webhook' | 'api_poll'
+  /** How payment_processed completion was observed. */
+  source?: 'webhook' | 'api_poll_fallback'
+  /** Bridge updated_at observed by the API poll, even when the webhook ultimately won. */
+  api_updated_at_epoch?: number
   summary: {
     event_id: string
     event_object_id: string
@@ -712,6 +714,7 @@ function summarizeRows(rows: any[]) {
   return {
     transfers: rows.length,
     completed: rows.filter((r) => r.completed === true).length,
+    api_poll_fallbacks: rows.filter((r) => r.payment_processed?.source === 'api_poll_fallback').length,
     timed_out: rows.filter((r) => r.timed_out === true).length,
     errors: rows.filter((r) => (r.error ?? '') !== '').length,
     latency_ms: {
@@ -743,6 +746,9 @@ function printSummaryTable(sections: { label: string; summary: ReturnType<typeof
     const cells = [runs, fmtSeconds(l.avg), fmtSeconds(l.p50), fmtSeconds(l.p90), fmtSeconds(l.p95), fmtSeconds(l.min), fmtSeconds(l.max)]
     log(`  ${label.padEnd(labelWidth)}  ${cells.map((c) => c.padStart(col)).join('')}`)
   }
+  const completed = sections.reduce((total, { summary }) => total + summary.completed, 0)
+  const fallbacks = sections.reduce((total, { summary }) => total + summary.api_poll_fallbacks, 0)
+  if (fallbacks) log(`  ⚠ ${fallbacks} of ${completed} completions fell back to API polling (webhook missed grace window)`)
   const problems = sections
     .filter(({ summary }) => summary.timed_out || summary.errors)
     .map(({ label, summary }) => `${label}: ${[summary.timed_out ? `${summary.timed_out} timed out` : '', summary.errors ? `${summary.errors} error${summary.errors === 1 ? '' : 's'}` : ''].filter(Boolean).join(', ')}`)
@@ -792,6 +798,7 @@ export type ProfileRunOptions = {
   runs: number
   batchSize: number
   timeoutSeconds: number
+  webhookGraceSeconds: number
   returnFundsAtEnd: boolean
   batchReturnSingleTx: boolean
   stopOnInsufficientBalance: boolean
@@ -1145,24 +1152,34 @@ export async function runProfile(options: ProfileRunOptions) {
       }
     }
 
-    // Bridge webhook delivery for payment_processed is occasionally missed (observed on
-    // cross-chain routes), so we race the webhook wait against polling the transfer API.
+    // Bridge webhook delivery is the primary completion signal. Polling only supplies a
+    // fallback when no webhook arrives within the grace window after API completion.
     const PROCESSED_POLL_INTERVAL_SECONDS = 10
-    const waitForProcessed = (keys: (string | undefined)[], transferId: string | undefined): Promise<WebhookRecord | null> => {
-      const webhookWait = receiver.waitForEvent(keys, 'payment_processed', options.timeoutSeconds)
+    const waitForProcessed = (keys: (string | undefined)[], transferId: string | undefined, requestStartEpoch: number): Promise<WebhookRecord | null> => {
+      const deadline = requestStartEpoch * 1000 + options.timeoutSeconds * 1000
+      const remainingSeconds = Math.max(0, (deadline - Date.now()) / 1000)
+      const webhookWait = receiver.waitForEvent(keys, 'payment_processed', remainingSeconds)
       if (!transferId) return webhookWait
 
       let settled = false
+      let pendingFallback: WebhookRecord | null = null
       return new Promise<WebhookRecord | null>((resolve) => {
         const settle = (record: WebhookRecord | null) => {
           if (settled) return
           settled = true
           resolve(record)
         }
-        void webhookWait.then(settle) // resolves with the record, or null at timeout
+        void webhookWait.then((record) => {
+          if (record) {
+            settle(pendingFallback
+              ? { ...record, api_updated_at_epoch: pendingFallback.api_updated_at_epoch! }
+              : record)
+          } else {
+            settle(pendingFallback)
+          }
+        })
 
         void (async () => {
-          const deadline = Date.now() + options.timeoutSeconds * 1000
           while (!settled && Date.now() < deadline) {
             await sleep(Math.min(PROCESSED_POLL_INTERVAL_SECONDS * 1000, Math.max(0, deadline - Date.now())))
             if (settled) return
@@ -1173,10 +1190,11 @@ export async function runProfile(options: ProfileRunOptions) {
             const updatedEpoch = transfer.updated_at ? Date.parse(transfer.updated_at) / 1000 : NaN
             const epoch = Number.isFinite(updatedEpoch) ? updatedEpoch : nowEpoch()
             const destinationTxHash = transfer.receipt?.destination_tx_hash
-            settle({
+            pendingFallback = {
               received_epoch: epoch,
               received_iso: isoFromEpoch(epoch),
-              source: 'api_poll',
+              source: 'api_poll_fallback',
+              api_updated_at_epoch: epoch,
               summary: {
                 event_id: '',
                 event_object_id: transfer.id ?? transferId,
@@ -1187,7 +1205,10 @@ export async function runProfile(options: ProfileRunOptions) {
                 ...(typeof destinationTxHash === 'string' && destinationTxHash ? { destination_tx_hash: destinationTxHash } : {}),
               },
               payload: transfer,
-            })
+            }
+            const graceDeadline = Math.min(deadline, Date.now() + options.webhookGraceSeconds * 1000)
+            await sleep(Math.max(0, graceDeadline - Date.now()))
+            settle(pendingFallback)
             return
           }
         })()
@@ -1214,7 +1235,7 @@ export async function runProfile(options: ProfileRunOptions) {
       } else {
         log(`  ${trip.label} ${i}: transfer ${shortId(request.transfer_id || '<missing>')} — waiting for payment_processed…`)
         const keys = [request.client_reference_id, request.transfer_id]
-        processed = await waitForProcessed(keys, request.transfer_id ?? undefined)
+        processed = await waitForProcessed(keys, request.transfer_id ?? undefined, request.request_start_epoch)
         if (processed) {
           completed = true
           returnAttempted = trip.direction === 'forward'
@@ -1296,7 +1317,7 @@ export async function runProfile(options: ProfileRunOptions) {
       if (completed) {
         const parts = [`request→processed ${fmtSecs(latencies.request_start_to_payment_processed_ms)}`]
         if (txHashForTimestamp) parts.push(`tx ${shortHash(txHashForTimestamp)}`)
-        if (processed?.source === 'api_poll') parts.push('via API poll (webhook not received)')
+        if (processed?.source === 'api_poll_fallback') parts.push(`via API fallback (webhook missed within ${options.webhookGraceSeconds}s grace)`)
         log(`  ${trip.label} ${i}: ✓ completed — ${parts.join(', ')}`)
       } else if (timedOut) {
         log(`  ${trip.label} ${i}: ✗ timed out after ${options.timeoutSeconds}s waiting for payment_processed`)
