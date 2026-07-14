@@ -748,7 +748,9 @@ function printSummaryTable(sections: { label: string; summary: ReturnType<typeof
   }
   const completed = sections.reduce((total, { summary }) => total + summary.completed, 0)
   const fallbacks = sections.reduce((total, { summary }) => total + summary.api_poll_fallbacks, 0)
-  if (fallbacks) log(`  ⚠ ${fallbacks} of ${completed} completions fell back to API polling (webhook missed grace window)`)
+  const sourceWarning = fallbacks ? '⚠ ' : ''
+  const fallbackSource = fallbacks ? ` · ${fallbacks} via API fallback (webhook missed grace window)` : ''
+  log(`  ${sourceWarning}completion source: ${completed - fallbacks}/${completed} webhook${fallbackSource}`)
   const problems = sections
     .filter(({ summary }) => summary.timed_out || summary.errors)
     .map(({ label, summary }) => `${label}: ${[summary.timed_out ? `${summary.timed_out} timed out` : '', summary.errors ? `${summary.errors} error${summary.errors === 1 ? '' : 's'}` : ''].filter(Boolean).join(', ')}`)
@@ -1318,7 +1320,8 @@ export async function runProfile(options: ProfileRunOptions) {
         const parts = [`request→processed ${fmtSecs(latencies.request_start_to_payment_processed_ms)}`]
         if (txHashForTimestamp) parts.push(`tx ${shortHash(txHashForTimestamp)}`)
         if (processed?.source === 'api_poll_fallback') parts.push(`via API fallback (webhook missed within ${options.webhookGraceSeconds}s grace)`)
-        log(`  ${trip.label} ${i}: ✓ completed — ${parts.join(', ')}`)
+        const sourceTag = processed?.source === 'webhook' ? ' (webhook)' : ''
+        log(`  ${trip.label} ${i}: ✓ completed — ${parts.join(', ')}${sourceTag}`)
       } else if (timedOut) {
         log(`  ${trip.label} ${i}: ✗ timed out after ${options.timeoutSeconds}s waiting for payment_processed`)
       } else {
