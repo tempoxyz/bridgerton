@@ -105,8 +105,10 @@ function requireApiSuccess(res: ApiResponse, action: string) {
 type WebhookRecord = {
   received_epoch: number
   received_iso: string
-  /** 'webhook' when delivered to our endpoint; 'api_poll' when observed by polling the Bridge API. */
-  source?: 'webhook' | 'api_poll'
+  /** How payment_processed completion was observed. */
+  source?: 'webhook' | 'api_poll_fallback'
+  /** Bridge updated_at observed by the API poll, even when the webhook ultimately won. */
+  api_updated_at_epoch?: number
   summary: {
     event_id: string
     event_object_id: string
@@ -482,6 +484,50 @@ async function returnFundsWithClient(
   }
 }
 
+async function returnFundsEvm(params: {
+  privateKey: string
+  rail: string
+  rpcUrl: string
+  to: Address
+  atoms: bigint
+  amount: string
+  currency: string
+  logPath: string
+}): Promise<boolean> {
+  const chain = EVM_CHAINS[params.rail]!
+  const token = EVM_USDC_ADDRESSES[params.rail]!
+  const account = privateKeyToAccount(params.privateKey as Hex)
+  const publicClient = createPublicClient({ chain, transport: http(params.rpcUrl) })
+  const walletClient = createWalletClient({ account, chain, transport: http(params.rpcUrl) })
+  const record = (entry: Record<string, unknown>) =>
+    appendFileSync(params.logPath, JSON.stringify({ ...entry, at: isoFromEpoch(nowEpoch()) }) + '\n')
+
+  log(`  · returning ${params.amount} ${params.currency} on ${params.rail} to Bridge wallet ${shortHash(params.to)}…`)
+  try {
+    const gasBalance = await publicClient.getBalance({ address: account.address })
+    if (gasBalance === 0n) {
+      log(`  ✗ return failed: ${account.address} has no ${chain.nativeCurrency.symbol} on ${params.rail} to pay gas`)
+      record({ ok: false, error: 'no_native_gas', chain: params.rail, amount: params.amount, to: params.to })
+      return false
+    }
+    const txHash = await walletClient.writeContract({
+      address: token,
+      abi: ERC20_ABI,
+      functionName: 'transfer',
+      args: [params.to, params.atoms],
+    })
+    await publicClient.waitForTransactionReceipt({ hash: txHash })
+    record({ ok: true, tx_hash: txHash, chain: params.rail, amount: params.amount, to: params.to })
+    log(`  ✓ funds returned (tx ${shortHash(txHash)})`)
+    return true
+  } catch (err) {
+    const message = String(err instanceof Error ? err.message : err).split('\n')[0]!
+    record({ ok: false, error: message, chain: params.rail, amount: params.amount, to: params.to })
+    log(`  ✗ return transfer failed: ${message}`)
+    return false
+  }
+}
+
 /**
  * Return funds from an EVM chain back to the local wallet on Tempo by creating a reverse
  * Bridge transfer (<rail> → tempo) and funding its deposit address with an ERC-20 transfer.
@@ -593,12 +639,28 @@ async function returnViaBridgeTransfer(params: {
 
 // --- Bridge wallet address ---
 
-async function fetchBridgeWalletAddress(walletId: string): Promise<string> {
+async function fetchBridgeWallet(walletId: string): Promise<{ address: string; chain?: string }> {
   const res = await apiRequest('GET', `/wallets/${walletId}`)
   requireApiSuccess(res, `Fetching Bridge wallet ${walletId}`)
   const address = res.json?.address ?? res.json?.data?.address ?? res.json?.wallet?.address
   if (!address) throw new Error(`Bridge wallet ${walletId} response did not include an address`)
-  return address
+  const chain = res.json?.chain ?? res.json?.data?.chain ?? res.json?.wallet?.chain
+  return { address, ...(chain ? { chain: String(chain) } : {}) }
+}
+
+async function fetchBridgeWalletBalance(walletId: string, currency: string): Promise<number | null> {
+  const res = await apiRequest('GET', `/wallets/${walletId}`)
+  if (res.http_code < 200 || res.http_code >= 300) return null
+  const balances = res.json?.balances ?? res.json?.data?.balances
+  if (!Array.isArray(balances)) return null
+  const entry = balances.find((b: any) => String(b.currency ?? '').toLowerCase() === currency.toLowerCase())
+  if (!entry) return 0
+  const value = Number(entry.balance ?? entry.amount ?? 0)
+  return Number.isFinite(value) ? value : null
+}
+
+async function fetchBridgeWalletAddress(walletId: string): Promise<string> {
+  return (await fetchBridgeWallet(walletId)).address
 }
 
 // --- result rows, CSV, summary ---
@@ -652,6 +714,7 @@ function summarizeRows(rows: any[]) {
   return {
     transfers: rows.length,
     completed: rows.filter((r) => r.completed === true).length,
+    api_poll_fallbacks: rows.filter((r) => r.payment_processed?.source === 'api_poll_fallback').length,
     timed_out: rows.filter((r) => r.timed_out === true).length,
     errors: rows.filter((r) => (r.error ?? '') !== '').length,
     latency_ms: {
@@ -683,6 +746,11 @@ function printSummaryTable(sections: { label: string; summary: ReturnType<typeof
     const cells = [runs, fmtSeconds(l.avg), fmtSeconds(l.p50), fmtSeconds(l.p90), fmtSeconds(l.p95), fmtSeconds(l.min), fmtSeconds(l.max)]
     log(`  ${label.padEnd(labelWidth)}  ${cells.map((c) => c.padStart(col)).join('')}`)
   }
+  const completed = sections.reduce((total, { summary }) => total + summary.completed, 0)
+  const fallbacks = sections.reduce((total, { summary }) => total + summary.api_poll_fallbacks, 0)
+  const sourceWarning = fallbacks ? '⚠ ' : ''
+  const fallbackSource = fallbacks ? ` · ${fallbacks} via API fallback (webhook missed grace window)` : ''
+  log(`  ${sourceWarning}completion source: ${completed - fallbacks}/${completed} webhook${fallbackSource}`)
   const problems = sections
     .filter(({ summary }) => summary.timed_out || summary.errors)
     .map(({ label, summary }) => `${label}: ${[summary.timed_out ? `${summary.timed_out} timed out` : '', summary.errors ? `${summary.errors} error${summary.errors === 1 ? '' : 's'}` : ''].filter(Boolean).join(', ')}`)
@@ -732,6 +800,7 @@ export type ProfileRunOptions = {
   runs: number
   batchSize: number
   timeoutSeconds: number
+  webhookGraceSeconds: number
   returnFundsAtEnd: boolean
   batchReturnSingleTx: boolean
   stopOnInsufficientBalance: boolean
@@ -808,7 +877,12 @@ export async function runProfile(options: ProfileRunOptions) {
   const account = privateKeyToAccount(privateKey as Hex)
   const destAddress = options.destAddress ?? account.address
   const tempoDest = options.destRail === 'tempo'
-  const returnsEnabled = !cryptoSource && tempoDest
+  const returnsEnabled = !cryptoSource && (tempoDest || (
+    EVM_CHAINS[options.destRail] != null && EVM_USDC_ADDRESSES[options.destRail] != null
+    && options.destCurrency.toLowerCase() === 'usdc'
+    && destAddress.toLowerCase() === account.address.toLowerCase()
+  ))
+  const directEvmReturnsEnabled = returnsEnabled && !tempoDest
   // For EVM destinations we run measured return trips (reverse Bridge transfers) at end of
   // run, but only when the destination is the local wallet (we control the funds).
   const evmReturnsEnabled = cryptoSource && !tempoDest && EVM_CHAINS[options.destRail] != null
@@ -818,7 +892,11 @@ export async function runProfile(options: ProfileRunOptions) {
   const tempoClient = makeTempoClient(privateKey, options.rpcUrl)
   const feeTokenAddress = resolveTempoFeeTokenAddress(options.feeToken)
   const tokenContract = options.tokenContract as Address
-  const bridgeWalletAddress = cryptoSource ? null : await fetchBridgeWalletAddress(sourceWalletId!)
+  const bridgeWallet = cryptoSource ? null : await fetchBridgeWallet(sourceWalletId!)
+  const bridgeWalletAddress = bridgeWallet?.address ?? null
+  const directEvmChainMatches = !directEvmReturnsEnabled
+    || bridgeWallet?.chain?.toLowerCase() === options.destRail.toLowerCase()
+  const returnsRunnable = returnsEnabled && directEvmChainMatches
 
   const destRpcUrl = options.destRpcUrl ?? (tempoDest ? options.rpcUrl : DEFAULT_DEST_RPC_URLS[options.destRail])
   const destReadClient = options.txTimestampLookup && destRpcUrl ? makeReadClient(destRpcUrl) : null
@@ -914,6 +992,11 @@ export async function runProfile(options: ProfileRunOptions) {
     log(`  receiver      http://127.0.0.1:${options.webhookPort}${options.webhookPath}`)
     if (!destReadClient) log(`  ⚠ no RPC known for destination rail ${options.destRail} — dest tx timestamp lookup disabled (pass --dest-rpc-url)`)
     if (evmReturnsEnabled) log(`  · measured return trips (${options.destRail} → tempo) run at end, one per completed run (needs ${evmChain!.nativeCurrency.symbol} gas on ${options.destRail})`)
+    else if (directEvmReturnsEnabled && !directEvmChainMatches) {
+      log(`  ⚠ direct returns skipped: source Bridge wallet chain ${bridgeWallet?.chain ?? 'unknown'} does not match destination rail ${options.destRail}`)
+    } else if (directEvmReturnsEnabled) {
+      log(`  · direct returns on ${options.destRail} to Bridge wallet ${shortHash(bridgeWalletAddress!)} (needs ${EVM_CHAINS[options.destRail]!.nativeCurrency.symbol} gas)`)
+    }
     else if (!returnsEnabled) log(`  ⚠ fund returns disabled for this route`)
     log('')
     log('Setup')
@@ -1008,6 +1091,32 @@ export async function runProfile(options: ProfileRunOptions) {
       return txHash
     }
 
+    /** Return completed bridge-wallet-source funds directly on their destination chain. */
+    const returnCompletedFunds = (amount: string): Promise<boolean> => {
+      const atoms = amountToAtomics(amount, options.tokenDecimals)
+      if (directEvmReturnsEnabled) {
+        return returnFundsEvm({
+          privateKey,
+          rail: options.destRail,
+          rpcUrl: destRpcUrl!,
+          to: bridgeWalletAddress as Address,
+          atoms,
+          amount,
+          currency: options.destCurrency,
+          logPath: returnsLog,
+        })
+      }
+      return returnFundsWithClient(tempoClient, {
+        token: tokenContract,
+        feeToken: feeTokenAddress,
+        to: bridgeWalletAddress as Address,
+        atoms,
+        amount,
+        currency: options.sourceCurrency,
+        logPath: returnsLog,
+      })
+    }
+
     /** Fund a crypto-source transfer by sending tokens to its Bridge deposit address. */
     const fundDeposit = async (request: TransferRequestRecord, trip: TripSpec): Promise<void> => {
       const i = request.run_index
@@ -1045,24 +1154,34 @@ export async function runProfile(options: ProfileRunOptions) {
       }
     }
 
-    // Bridge webhook delivery for payment_processed is occasionally missed (observed on
-    // cross-chain routes), so we race the webhook wait against polling the transfer API.
+    // Bridge webhook delivery is the primary completion signal. Polling only supplies a
+    // fallback when no webhook arrives within the grace window after API completion.
     const PROCESSED_POLL_INTERVAL_SECONDS = 10
-    const waitForProcessed = (keys: (string | undefined)[], transferId: string | undefined): Promise<WebhookRecord | null> => {
-      const webhookWait = receiver.waitForEvent(keys, 'payment_processed', options.timeoutSeconds)
+    const waitForProcessed = (keys: (string | undefined)[], transferId: string | undefined, requestStartEpoch: number): Promise<WebhookRecord | null> => {
+      const deadline = requestStartEpoch * 1000 + options.timeoutSeconds * 1000
+      const remainingSeconds = Math.max(0, (deadline - Date.now()) / 1000)
+      const webhookWait = receiver.waitForEvent(keys, 'payment_processed', remainingSeconds)
       if (!transferId) return webhookWait
 
       let settled = false
+      let pendingFallback: WebhookRecord | null = null
       return new Promise<WebhookRecord | null>((resolve) => {
         const settle = (record: WebhookRecord | null) => {
           if (settled) return
           settled = true
           resolve(record)
         }
-        void webhookWait.then(settle) // resolves with the record, or null at timeout
+        void webhookWait.then((record) => {
+          if (record) {
+            settle(pendingFallback
+              ? { ...record, api_updated_at_epoch: pendingFallback.api_updated_at_epoch! }
+              : record)
+          } else {
+            settle(pendingFallback)
+          }
+        })
 
         void (async () => {
-          const deadline = Date.now() + options.timeoutSeconds * 1000
           while (!settled && Date.now() < deadline) {
             await sleep(Math.min(PROCESSED_POLL_INTERVAL_SECONDS * 1000, Math.max(0, deadline - Date.now())))
             if (settled) return
@@ -1073,10 +1192,11 @@ export async function runProfile(options: ProfileRunOptions) {
             const updatedEpoch = transfer.updated_at ? Date.parse(transfer.updated_at) / 1000 : NaN
             const epoch = Number.isFinite(updatedEpoch) ? updatedEpoch : nowEpoch()
             const destinationTxHash = transfer.receipt?.destination_tx_hash
-            settle({
+            pendingFallback = {
               received_epoch: epoch,
               received_iso: isoFromEpoch(epoch),
-              source: 'api_poll',
+              source: 'api_poll_fallback',
+              api_updated_at_epoch: epoch,
               summary: {
                 event_id: '',
                 event_object_id: transfer.id ?? transferId,
@@ -1087,7 +1207,10 @@ export async function runProfile(options: ProfileRunOptions) {
                 ...(typeof destinationTxHash === 'string' && destinationTxHash ? { destination_tx_hash: destinationTxHash } : {}),
               },
               payload: transfer,
-            })
+            }
+            const graceDeadline = Math.min(deadline, Date.now() + options.webhookGraceSeconds * 1000)
+            await sleep(Math.max(0, graceDeadline - Date.now()))
+            settle(pendingFallback)
             return
           }
         })()
@@ -1114,7 +1237,7 @@ export async function runProfile(options: ProfileRunOptions) {
       } else {
         log(`  ${trip.label} ${i}: transfer ${shortId(request.transfer_id || '<missing>')} — waiting for payment_processed…`)
         const keys = [request.client_reference_id, request.transfer_id]
-        processed = await waitForProcessed(keys, request.transfer_id ?? undefined)
+        processed = await waitForProcessed(keys, request.transfer_id ?? undefined, request.request_start_epoch)
         if (processed) {
           completed = true
           returnAttempted = trip.direction === 'forward'
@@ -1196,8 +1319,9 @@ export async function runProfile(options: ProfileRunOptions) {
       if (completed) {
         const parts = [`request→processed ${fmtSecs(latencies.request_start_to_payment_processed_ms)}`]
         if (txHashForTimestamp) parts.push(`tx ${shortHash(txHashForTimestamp)}`)
-        if (processed?.source === 'api_poll') parts.push('via API poll (webhook not received)')
-        log(`  ${trip.label} ${i}: ✓ completed — ${parts.join(', ')}`)
+        if (processed?.source === 'api_poll_fallback') parts.push(`via API fallback (webhook missed within ${options.webhookGraceSeconds}s grace)`)
+        const sourceTag = processed?.source === 'webhook' ? ' (webhook)' : ''
+        log(`  ${trip.label} ${i}: ✓ completed — ${parts.join(', ')}${sourceTag}`)
       } else if (timedOut) {
         log(`  ${trip.label} ${i}: ✗ timed out after ${options.timeoutSeconds}s waiting for payment_processed`)
       } else {
@@ -1243,44 +1367,54 @@ export async function runProfile(options: ProfileRunOptions) {
         log(`  ⚠ stopping early: source balance insufficient (${insufficientBalanceCount} failed request${insufficientBalanceCount === 1 ? '' : 's'})`)
       }
 
-      if (!options.returnFundsAtEnd && pendingReturnCount > 0 && returnsEnabled) {
+      if (!options.returnFundsAtEnd && pendingReturnCount > 0 && returnsRunnable) {
         if (options.batchReturnSingleTx) {
           const returnAmount = multiplyAmount(options.amount, pendingReturnCount, options.tokenDecimals)
-          const ok = await returnFundsWithClient(tempoClient, {
-            token: tokenContract, feeToken: feeTokenAddress, to: bridgeWalletAddress as Address,
-            atoms: amountToAtomics(returnAmount, options.tokenDecimals), amount: returnAmount,
-            currency: options.sourceCurrency, logPath: returnsLog,
-          })
+          const ok = await returnCompletedFunds(returnAmount)
           if (ok) pendingReturnCount = 0
           else { returnFailureCount += 1; log(`  ⚠ return failed — ${pendingReturnCount} transfer${pendingReturnCount === 1 ? '' : 's'} carried forward`) }
         } else {
           while (pendingReturnCount > 0) {
-            const ok = await returnFundsWithClient(tempoClient, {
-              token: tokenContract, feeToken: feeTokenAddress, to: bridgeWalletAddress as Address,
-              atoms: amountToAtomics(options.amount, options.tokenDecimals), amount: options.amount,
-              currency: options.sourceCurrency, logPath: returnsLog,
-            })
+            const ok = await returnCompletedFunds(options.amount)
             if (ok) pendingReturnCount -= 1
             else { returnFailureCount += 1; log(`  ⚠ return failed — ${pendingReturnCount} transfer${pendingReturnCount === 1 ? '' : 's'} carried forward`); break }
           }
         }
       }
 
-      if (!stopRequested && !options.returnFundsAtEnd && options.postReturnSettleSeconds > 0 && batchEnd < options.runs) {
-        log(`  · waiting ${options.postReturnSettleSeconds}s for returns to settle before next batch…`)
-        await sleep(options.postReturnSettleSeconds * 1000)
+      if (!stopRequested && !options.returnFundsAtEnd && batchEnd < options.runs) {
+        if (options.postReturnSettleSeconds > 0) {
+          log(`  · waiting ${options.postReturnSettleSeconds}s for returns to settle before next batch…`)
+          await sleep(options.postReturnSettleSeconds * 1000)
+        }
+        if (!cryptoSource && sourceWalletId && returnsRunnable) {
+          const nextBatchSize = Math.min(options.batchSize, options.runs - batchEnd)
+          const needed = Number(options.amount) * nextBatchSize
+          const deadline = Date.now() + 180_000
+          let logged = false
+          while (Date.now() < deadline) {
+            const balance = await fetchBridgeWalletBalance(sourceWalletId, options.sourceCurrency)
+            if (balance == null || balance >= needed) break
+            if (!logged) {
+              log(`  · waiting for Bridge wallet balance to recover (${balance} < ${needed} ${options.sourceCurrency})…`)
+              logged = true
+            }
+            await sleep(5000)
+          }
+          if (logged) {
+            const balance = await fetchBridgeWalletBalance(sourceWalletId, options.sourceCurrency)
+            if (balance != null && balance < needed) log(`  ⚠ Bridge wallet balance still ${balance} ${options.sourceCurrency} (< ${needed}) after waiting — next batch may fail`)
+            else log('  ✓ Bridge wallet balance recovered')
+          }
+        }
       }
     }
 
-    if (options.returnFundsAtEnd && totalCompleted > 0 && returnsEnabled) {
+    if (options.returnFundsAtEnd && totalCompleted > 0 && returnsRunnable) {
       const returnAmount = multiplyAmount(options.amount, totalCompleted, options.tokenDecimals)
       log('')
       log('Return funds')
-      const ok = await returnFundsWithClient(tempoClient, {
-        token: tokenContract, feeToken: feeTokenAddress, to: bridgeWalletAddress as Address,
-        atoms: amountToAtomics(returnAmount, options.tokenDecimals), amount: returnAmount,
-        currency: options.sourceCurrency, logPath: returnsLog,
-      })
+      const ok = await returnCompletedFunds(returnAmount)
       if (ok) pendingReturnCount = 0
       else { returnFailureCount += 1; pendingReturnCount = totalCompleted }
     }

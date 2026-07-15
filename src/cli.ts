@@ -1183,6 +1183,7 @@ profile.command('run', {
     runs: z.number().default(10).describe('Total number of transfers to profile'),
     batchSize: z.number().default(10).describe('Transfers created concurrently per batch'),
     timeoutSeconds: z.number().default(180).describe('Seconds to wait for payment_processed per transfer'),
+    webhookGraceSeconds: z.number().default(60).describe('Seconds to keep waiting for the webhook after the API poll observes completion'),
     returnFundsAtEnd: z.boolean().default(false).describe('Return funds once after all runs instead of per batch'),
     batchReturnSingleTx: z.boolean().default(true).describe('Return each batch as one on-chain transaction'),
     stopOnInsufficientBalance: z.boolean().default(true).describe('Stop early when the Bridge wallet balance is insufficient'),
