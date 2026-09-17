@@ -7,13 +7,22 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   verify:
     name: Verify
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@05c669ce878b8719779a28fe7375ba85822403f8
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
       - uses: tempoxyz/gh-actions/vendor/oven-sh/setup-bun@6f436eb3a168279692739e8c0c9fdb52b94bfae7
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
@@ -33,12 +42,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@05c669ce878b8719779a28fe7375ba85822403f8
       - name: Fetch GitHub token via STS
         id: sts
         uses: tempoxyz/gh-actions/actions/github-sts@c0292122e255def866c64c55e5844d1e7d5fe7ad # main
         with:
           policy: changesets
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # zizmor: ignore[artipacked] Changesets needs the App token for authenticated version commits and release tags.
         with:
           fetch-depth: 0
           token: ${{ steps.sts.outputs.token }}
@@ -54,4 +65,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.sts.outputs.token }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-
