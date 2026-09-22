@@ -52,6 +52,7 @@ type TransferCreateOptions = {
   destAddress?: string | undefined
   destWalletId?: string | undefined
   amount?: string | undefined
+  dryRun?: boolean | undefined
   flexibleAmount?: boolean | undefined
   staticTemplate?: boolean | undefined
   allowAnyFromAddress?: boolean | undefined
@@ -85,7 +86,7 @@ function transferListParams(options: {
   return Object.keys(params).length ? params : undefined
 }
 
-function buildTransferBody(options: TransferCreateOptions, forceStaticTemplate = false) {
+export function buildTransferBody(options: TransferCreateOptions, forceStaticTemplate = false) {
   const {
     onBehalfOf,
     sourceRail,
@@ -95,6 +96,7 @@ function buildTransferBody(options: TransferCreateOptions, forceStaticTemplate =
     destAddress,
     destWalletId,
     amount,
+    dryRun,
     flexibleAmount,
     staticTemplate,
     allowAnyFromAddress,
@@ -120,6 +122,7 @@ function buildTransferBody(options: TransferCreateOptions, forceStaticTemplate =
   if (destAddress) body.destination.to_address = destAddress
   if (destWalletId) body.destination.bridge_wallet_id = destWalletId
   if (amount) body.amount = amount
+  if (dryRun) body.dry_run = true
   if (sourceAddress) body.source.from_address = sourceAddress
   if (sourceWalletId) body.source.bridge_wallet_id = sourceWalletId
   if (externalAccountId) body.source.external_account_id = externalAccountId
@@ -282,6 +285,7 @@ transfers.command('create', {
     destAddress: z.string().optional().describe('Destination blockchain address'),
     destWalletId: z.string().optional().describe('Destination Bridge wallet ID (when sending to a Bridge wallet)'),
     amount: z.string().optional().describe('Transfer amount'),
+    dryRun: z.boolean().optional().default(false).describe('Validate the transfer without creating it'),
     flexibleAmount: z.boolean().optional().default(false).describe('Allow any deposit amount'),
     staticTemplate: z.boolean().optional().default(false).describe('Create reusable static transfer template deposit instructions'),
     allowAnyFromAddress: z.boolean().optional().default(false).describe('Allow crypto deposits from any source address'),
