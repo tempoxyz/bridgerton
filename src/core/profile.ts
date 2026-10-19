@@ -8,11 +8,12 @@ import { privateKeyToAccount } from 'viem/accounts'
 import { arbitrum, base, mainnet, optimism, polygon } from 'viem/chains'
 import { createClient } from 'viem/tempo'
 import { getApiKey, url } from './client.js'
+import { pathusd, usdc, usdce } from 'viem/tokens'
 
 // --- constants ---
 
-export const TEMPO_USDC_E_TOKEN_ADDRESS = '0x20c000000000000000000000b9537d11c60e8b50'
-export const TEMPO_PATHUSD_TOKEN_ADDRESS = '0x20c0000000000000000000000000000000000000'
+export const TEMPO_USDC_E_TOKEN_ADDRESS = usdce(4217).address
+export const TEMPO_PATHUSD_TOKEN_ADDRESS = pathusd(4217).address
 const ALL_WEBHOOK_EVENT_CATEGORIES = [
   'customer', 'kyc_link', 'liquidation_address.drain', 'static_memo.activity', 'transfer',
   'virtual_account.activity', 'bridge_wallet.activity', 'card_account', 'card_transaction',
@@ -406,10 +407,10 @@ const EVM_CHAINS: Record<string, Chain> = {
 
 /** USDC contract addresses per EVM rail, for reverse (return) transfers. */
 const EVM_USDC_ADDRESSES: Record<string, Address> = {
-  polygon: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
-  ethereum: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
-  base: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
-  arbitrum: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+  polygon: usdc(137).address,
+  ethereum: usdc(1).address,
+  base: usdc(8453).address,
+  arbitrum: usdc(42161).address,
   optimism: '0x0b2C639c533813f4Aa9D7837CAcAd6dA3ABF2Fc4A',
 }
 
@@ -417,7 +418,7 @@ export function resolveTempoFeeTokenAddress(feeToken: string): Address {
   const lower = feeToken.toLowerCase()
   if (['pathusd', 'path_usd'].includes(lower)) return TEMPO_PATHUSD_TOKEN_ADDRESS
   if (['usdc.e', 'usdce', 'usdc_e', 'usdc'].includes(lower)) return TEMPO_USDC_E_TOKEN_ADDRESS
-  if ([TEMPO_PATHUSD_TOKEN_ADDRESS, TEMPO_USDC_E_TOKEN_ADDRESS].includes(lower)) return feeToken as Address
+  if (lower === TEMPO_PATHUSD_TOKEN_ADDRESS || lower === TEMPO_USDC_E_TOKEN_ADDRESS) return feeToken as Address
   throw new Error('--fee-token must be pathusd, usdc.e, or a known Tempo fee token address')
 }
 
