@@ -57,11 +57,12 @@ jobs:
       - run: bun install --frozen-lockfile
       - uses: tempoxyz/gh-actions/vendor/changesets/action@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
-          title: 'chore: version packages'
-          commit: 'chore: version packages'
-          version: bun run changeset:version
-          publish: bun run changeset:publish
-          createGithubReleases: true
+          github-token: ${{ steps.sts.outputs.token }}
+          pr-title: 'chore: version packages'
+          commit-message: 'chore: version packages'
+          version-script: bun run changeset:version
+          publish-script: bun run changeset:publish
+          create-github-releases: true
         env:
           GITHUB_TOKEN: ${{ steps.sts.outputs.token }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
